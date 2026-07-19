@@ -41,8 +41,10 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	defer lease.Release()
 	parentID := ""
 	references := make([]string, 0, len(request.ReferenceURLs))
+	directUploadAvailable := true
 	for _, rawReference := range request.ReferenceURLs {
-		reference, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference)
+		reference, directAvailable, referenceErr := a.prepareVideoReference(ctx, cfg, lease, token, rawReference, directUploadAvailable)
+		directUploadAvailable = directAvailable
 		if referenceErr != nil {
 			return provider.VideoResult{}, referenceErr
 		}
@@ -81,23 +83,23 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	return result, nil
 }
 
-func (a *Adapter) prepareVideoReference(ctx context.Context, cfg Config, lease *egress.Lease, token, value string) (string, error) {
+func (a *Adapter) prepareVideoReference(ctx context.Context, cfg Config, lease *egress.Lease, token, value string, directUploadAvailable bool) (string, bool, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "", fmt.Errorf("视频参考图片 URL 不能为空")
+		return "", directUploadAvailable, fmt.Errorf("视频参考图片 URL 不能为空")
 	}
 	image, err := a.loadChatImage(ctx, lease, value, cfg.MaxInputImageBytes)
 	if err != nil {
-		return "", err
+		return "", directUploadAvailable, err
 	}
-	uploaded, err := a.uploadFileLegacy(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine")
+	uploaded, directAvailable, err := a.uploadFileWithFallback(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, directUploadAvailable)
 	if err != nil {
-		return "", err
+		return "", directAvailable, err
 	}
 	if uploaded.URI == "" {
-		return "", fmt.Errorf("上传视频参考图片后未返回 fileUri")
+		return "", directAvailable, fmt.Errorf("上传视频参考图片后未返回 fileUri")
 	}
-	return uploaded.URI, nil
+	return uploaded.URI, directAvailable, nil
 }
 
 type videoContentReadCloser struct {

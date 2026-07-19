@@ -74,6 +74,88 @@ func TestParseMediaPostResponsePreservesStatusAndPostID(t *testing.T) {
 	}
 }
 
+func TestGenerateVideoReferenceUsesDirectUpload(t *testing.T) {
+	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	directUploadCalled := false
+	legacyUploadCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/http/upload-file-v2/direct":
+			directUploadCalled = true
+			if err := request.ParseMultipartForm(2 << 20); err != nil {
+				t.Errorf("parse direct upload: %v", err)
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if request.FormValue("file_source") != imagineSelfUploadSource {
+				t.Errorf("file_source = %q", request.FormValue("file_source"))
+			}
+			file, header, err := request.FormFile("file")
+			if err != nil {
+				t.Errorf("direct upload file: %v", err)
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+			content, _ := io.ReadAll(file)
+			if header.Header.Get("Content-Type") != "image/png" || len(content) == 0 {
+				t.Errorf("content-type=%q bytes=%d", header.Header.Get("Content-Type"), len(content))
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"uploadId":"upload_1","fileMetadata":{"fileMetadataId":"file_1","fileUri":"users/test/reference/content"}}`)
+		case "/rest/app-chat/upload-file":
+			legacyUploadCalled = true
+			http.Error(writer, "legacy upload must not be used", http.StatusInternalServerError)
+		case "/rest/media/post/create":
+			var payload map[string]any
+			if json.NewDecoder(request.Body).Decode(&payload) != nil || payload["mediaType"] != "MEDIA_POST_TYPE_IMAGE" || payload["mediaUrl"] != "https://assets.grok.com/users/test/reference/content" {
+				t.Errorf("media post payload = %#v", payload)
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"post":{"id":"post_1"}}`)
+		case "/rest/app-chat/conversations/new":
+			var payload map[string]any
+			if json.NewDecoder(request.Body).Decode(&payload) != nil {
+				t.Error("video payload is invalid JSON")
+			}
+			metadata, _ := payload["responseMetadata"].(map[string]any)
+			override, _ := metadata["modelConfigOverride"].(map[string]any)
+			modelMap, _ := override["modelMap"].(map[string]any)
+			config, _ := modelMap["videoGenModelConfig"].(map[string]any)
+			references, _ := config["imageReferences"].([]any)
+			if config["parentPostId"] != "post_1" || len(references) != 1 || references[0] != "https://assets.grok.com/users/test/reference/content" {
+				t.Errorf("video config = %#v", config)
+			}
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, "data: {\"result\":{\"response\":{\"streamingVideoGenerationResponse\":{\"progress\":100,\"videoPostId\":\"post_1\",\"videoUrl\":\"users/test/generated/post_1/generated_video.mp4\"}}}}\n")
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statsig := base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{'s'}, 70))
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: statsig}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	result, err := adapter.GenerateVideo(context.Background(), provider.VideoRequest{
+		Credential: account.Credential{ID: 1, EncryptedAccessToken: encrypted}, Prompt: "animate", Duration: 6,
+		AspectRatio: "16:9", Resolution: "720p", ReferenceURLs: []string{dataURI},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !directUploadCalled || legacyUploadCalled || result.URL != "https://assets.grok.com/users/test/generated/post_1/generated_video.mp4" {
+		t.Fatalf("direct=%t legacy=%t result=%#v", directUploadCalled, legacyUploadCalled, result)
+	}
+}
+
 func TestWebChatPricingUsesGrok45(t *testing.T) {
 	registry := provider.NewRegistry(&Adapter{})
 	for _, upstreamModel := range []string{"grok-chat-fast", "grok-chat-auto", "grok-chat-expert", "grok-chat-heavy"} {
