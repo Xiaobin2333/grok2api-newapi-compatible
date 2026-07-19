@@ -62,11 +62,17 @@ definitions:
       prompt:
         example: A cinematic city at night
         type: string
+      quality:
+        example: high
+        type: string
       resolution:
         example: 2k
         type: string
       response_format:
         example: url
+        type: string
+      size:
+        example: 1024x1024
         type: string
       stream:
         example: false
@@ -100,6 +106,24 @@ definitions:
       stream:
         example: false
         type: boolean
+    type: object
+  httpserver.SwaggerOpenAIVideoGenerationRequest:
+    properties:
+      input_reference:
+        example: https://example.com/source.png
+        type: string
+      model:
+        example: grok-imagine-video
+        type: string
+      prompt:
+        example: A cinematic tracking shot in the rain
+        type: string
+      seconds:
+        example: "8"
+        type: string
+      size:
+        example: 1280x720
+        type: string
     type: object
   httpserver.SwaggerResponsesRequest:
     properties:
@@ -449,6 +473,36 @@ paths:
       summary: 压缩 Response 上下文
       tags:
       - Responses
+  /v1/videos:
+    post:
+      consumes:
+      - application/json
+      - multipart/form-data
+      parameters:
+      - description: 请求
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/httpserver.SwaggerOpenAIVideoGenerationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: 创建 OpenAI / NewAPI 兼容视频任务
+      tags:
+      - Videos
   /v1/videos/{request_id}:
     get:
       parameters:
@@ -473,6 +527,31 @@ paths:
       security:
       - BearerAuth: []
       summary: 查询异步视频任务
+      tags:
+      - Videos
+  /v1/videos/{request_id}/content:
+    get:
+      parameters:
+      - description: Request ID
+        in: path
+        name: request_id
+        required: true
+        type: string
+      produces:
+      - video/mp4
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: 下载已完成视频内容
       tags:
       - Videos
   /v1/videos/generations:

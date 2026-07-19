@@ -272,6 +272,7 @@ Authorization: Bearer g2a_xxx_xxx
 | `POST` | `/v1/messages` | Anthropic Messages JSON / SSE |
 | `POST` | `/v1/images/generations` | 图片生成 |
 | `POST` | `/v1/images/edits` | 图片编辑，支持 JSON 与 multipart |
+| `POST` | `/v1/videos` | OpenAI / NewAPI 兼容异步视频任务 |
 | `POST` | `/v1/videos/generations` | 创建异步视频任务 |
 | `GET` | `/v1/videos/{request_id}` | 查询视频任务 |
 | `GET` | `/v1/videos/{request_id}/content` | 获取视频任务内容 |

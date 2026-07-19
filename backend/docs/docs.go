@@ -497,6 +497,53 @@ const docTemplate = `{
                 }
             }
         },
+        "/v1/videos": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json",
+                    "multipart/form-data"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Videos"
+                ],
+                "summary": "创建 OpenAI / NewAPI 兼容视频任务",
+                "parameters": [
+                    {
+                        "description": "请求",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/httpserver.SwaggerOpenAIVideoGenerationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/v1/videos/generations": {
             "post": {
                 "security": [
@@ -574,6 +621,46 @@ const docTemplate = `{
                         "schema": {
                             "type": "object",
                             "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/v1/videos/{request_id}/content": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "video/mp4"
+                ],
+                "tags": [
+                    "Videos"
+                ],
+                "summary": "下载已完成视频内容",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Request ID",
+                        "name": "request_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "file"
                         }
                     },
                     "404": {
@@ -674,6 +761,10 @@ const docTemplate = `{
                     "type": "string",
                     "example": "A cinematic city at night"
                 },
+                "quality": {
+                    "type": "string",
+                    "example": "high"
+                },
                 "resolution": {
                     "type": "string",
                     "example": "2k"
@@ -681,6 +772,10 @@ const docTemplate = `{
                 "response_format": {
                     "type": "string",
                     "example": "url"
+                },
+                "size": {
+                    "type": "string",
+                    "example": "1024x1024"
                 },
                 "stream": {
                     "type": "boolean",
@@ -727,6 +822,31 @@ const docTemplate = `{
                 "stream": {
                     "type": "boolean",
                     "example": false
+                }
+            }
+        },
+        "httpserver.SwaggerOpenAIVideoGenerationRequest": {
+            "type": "object",
+            "properties": {
+                "input_reference": {
+                    "type": "string",
+                    "example": "https://example.com/source.png"
+                },
+                "model": {
+                    "type": "string",
+                    "example": "grok-imagine-video"
+                },
+                "prompt": {
+                    "type": "string",
+                    "example": "A cinematic tracking shot in the rain"
+                },
+                "seconds": {
+                    "type": "string",
+                    "example": "8"
+                },
+                "size": {
+                    "type": "string",
+                    "example": "1280x720"
                 }
             }
         },

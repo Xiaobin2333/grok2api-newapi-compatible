@@ -36,6 +36,8 @@ type SwaggerImageGenerationRequest struct {
 	Model          string `json:"model" example:"grok-imagine-image-quality"`
 	Prompt         string `json:"prompt" example:"A cinematic city at night"`
 	N              int    `json:"n" example:"1"`
+	Size           string `json:"size,omitempty" example:"1024x1024"`
+	Quality        string `json:"quality,omitempty" example:"high"`
 	AspectRatio    string `json:"aspect_ratio,omitempty" example:"16:9"`
 	Resolution     string `json:"resolution,omitempty" example:"2k"`
 	ResponseFormat string `json:"response_format,omitempty" example:"url"`
@@ -69,6 +71,15 @@ type SwaggerVideoGenerationRequest struct {
 	Duration    int    `json:"duration" example:"8"`
 	AspectRatio string `json:"aspect_ratio,omitempty" example:"16:9"`
 	Resolution  string `json:"resolution,omitempty" example:"720p"`
+}
+
+// SwaggerOpenAIVideoGenerationRequest 表示 OpenAI / NewAPI 兼容视频请求。
+type SwaggerOpenAIVideoGenerationRequest struct {
+	Model          string `json:"model" example:"grok-imagine-video"`
+	Prompt         string `json:"prompt" example:"A cinematic tracking shot in the rain"`
+	Seconds        string `json:"seconds,omitempty" example:"8"`
+	Size           string `json:"size,omitempty" example:"1280x720"`
+	InputReference string `json:"input_reference,omitempty" example:"https://example.com/source.png"`
 }
 
 // swaggerHealth godoc
@@ -217,6 +228,18 @@ func swaggerGetImage() {}
 // @Router /v1/videos/generations [post]
 func swaggerGenerateVideo() {}
 
+// swaggerGenerateOpenAIVideo godoc
+// @Summary 创建 OpenAI / NewAPI 兼容视频任务
+// @Tags Videos
+// @Security BearerAuth
+// @Accept json,mpfd
+// @Produce json
+// @Param request body SwaggerOpenAIVideoGenerationRequest true "请求"
+// @Success 200 {object} map[string]any
+// @Failure 400 {object} map[string]any
+// @Router /v1/videos [post]
+func swaggerGenerateOpenAIVideo() {}
+
 // swaggerGetVideo godoc
 // @Summary 查询异步视频任务
 // @Tags Videos
@@ -227,3 +250,14 @@ func swaggerGenerateVideo() {}
 // @Failure 404 {object} map[string]any
 // @Router /v1/videos/{request_id} [get]
 func swaggerGetVideo() {}
+
+// swaggerGetVideoContent godoc
+// @Summary 下载已完成视频内容
+// @Tags Videos
+// @Security BearerAuth
+// @Produce video/mp4
+// @Param request_id path string true "Request ID"
+// @Success 200 {file} binary
+// @Failure 404 {object} map[string]any
+// @Router /v1/videos/{request_id}/content [get]
+func swaggerGetVideoContent() {}

@@ -271,6 +271,7 @@ Authorization: Bearer g2a_xxx_xxx
 | `POST` | `/v1/messages` | Anthropic Messages JSON / SSE |
 | `POST` | `/v1/images/generations` | Image generation |
 | `POST` | `/v1/images/edits` | Image editing with JSON or multipart input |
+| `POST` | `/v1/videos` | OpenAI / NewAPI-compatible asynchronous video job |
 | `POST` | `/v1/videos/generations` | Create an asynchronous video job |
 | `GET` | `/v1/videos/{request_id}` | Inspect a video job |
 | `GET` | `/v1/videos/{request_id}/content` | Retrieve video job content |

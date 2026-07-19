@@ -86,7 +86,7 @@ func (a *Adapter) prepareVideoReference(ctx context.Context, cfg Config, lease *
 	if value == "" {
 		return "", fmt.Errorf("视频参考图片 URL 不能为空")
 	}
-	image, err := a.loadChatImage(ctx, lease, value, 20<<20)
+	image, err := a.loadChatImage(ctx, lease, value, cfg.MaxInputImageBytes)
 	if err != nil {
 		return "", err
 	}

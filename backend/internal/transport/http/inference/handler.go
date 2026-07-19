@@ -15,6 +15,7 @@ import (
 
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	mediaapp "github.com/chenyme/grok2api/backend/internal/application/media"
 	modelapp "github.com/chenyme/grok2api/backend/internal/application/model"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
@@ -33,6 +34,8 @@ type Handler struct {
 
 const (
 	responseCopyBufferBytes        = 32 << 10
+	openAIVideoMultipartMemory     = 1 << 20
+	openAIVideoReferenceMaxBytes   = int64(32 << 20)
 	maxJSONMetadataInspectionBytes = 8 << 20
 	maxStreamEventInspectionBytes  = 8 << 20
 	maxJSONResponseTransferBytes   = 128 << 20
@@ -81,6 +84,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.POST("/messages", h.createMessage)
 	router.POST("/images/generations", h.generateImage)
 	router.POST("/images/edits", h.editImage)
+	router.POST("/videos", h.generateOpenAIVideo)
 	router.POST("/videos/generations", h.generateVideo)
 	router.GET("/videos/:requestId", h.getVideo)
 	router.GET("/videos/:requestId/content", h.getVideoContent)
@@ -116,6 +120,7 @@ type imageGenerationRequest struct {
 	Count          *int            `json:"n"`
 	PartialImages  *int            `json:"partial_images"`
 	Size           string          `json:"size"`
+	Quality        string          `json:"quality"`
 	AspectRatio    string          `json:"aspect_ratio"`
 	Resolution     string          `json:"resolution"`
 	ResponseFormat string          `json:"response_format"`
@@ -146,6 +151,7 @@ type imageEditJSONRequest struct {
 type videoGenerationImage struct {
 	URL    string `json:"url"`
 	FileID string `json:"file_id"`
+	Data   []byte `json:"-"`
 }
 
 type videoGenerationRequest struct {
@@ -159,6 +165,27 @@ type videoGenerationRequest struct {
 	ReferenceImages []videoGenerationImage `json:"reference_images"`
 	Output          json.RawMessage        `json:"output"`
 	StorageOptions  json.RawMessage        `json:"storage_options"`
+	ResponseSize    string                 `json:"-"`
+}
+
+type openAIVideoGenerationRequest struct {
+	Model           string                 `json:"model"`
+	Prompt          string                 `json:"prompt"`
+	User            *string                `json:"user"`
+	Duration        json.RawMessage        `json:"duration"`
+	Seconds         json.RawMessage        `json:"seconds"`
+	Size            string                 `json:"size"`
+	Quality         string                 `json:"quality"`
+	AspectRatio     string                 `json:"aspect_ratio"`
+	Resolution      string                 `json:"resolution"`
+	Image           json.RawMessage        `json:"image"`
+	Images          []string               `json:"images"`
+	InputReference  string                 `json:"input_reference"`
+	ReferenceImages []videoGenerationImage `json:"reference_images"`
+	Output          json.RawMessage        `json:"output"`
+	StorageOptions  json.RawMessage        `json:"storage_options"`
+	ImageFile       *videoGenerationImage  `json:"-"`
+	InputFile       *videoGenerationImage  `json:"-"`
 }
 
 type modelListItem struct {
@@ -291,6 +318,11 @@ func (h *Handler) generateImage(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 storage_options")
 		return
 	}
+	resolution, err := resolveOpenAIImageResolution(request.Resolution, request.Quality)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", err.Error())
+		return
+	}
 	count := 1
 	if request.Count != nil {
 		if *request.Count < 1 || *request.Count > 10 {
@@ -322,7 +354,7 @@ func (h *Handler) generateImage(c *gin.Context) {
 	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
-		Resolution: request.Resolution, ResponseFormat: request.ResponseFormat,
+		Resolution: resolution, ResponseFormat: request.ResponseFormat,
 		Streaming: request.Stream, PartialImages: partialImages,
 	})
 	if err != nil {
@@ -330,6 +362,23 @@ func (h *Handler) generateImage(c *gin.Context) {
 		return
 	}
 	h.writeResult(c, result, request.Stream, streamProtocolImage)
+}
+
+func resolveOpenAIImageResolution(resolution, quality string) (string, error) {
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	if resolution != "" {
+		return resolution, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "":
+		return "", nil
+	case "auto", "standard", "medium", "low":
+		return "1k", nil
+	case "high", "hd":
+		return "2k", nil
+	default:
+		return "", fmt.Errorf("quality 必须是 auto、standard、low、medium、high 或 hd")
+	}
 }
 
 func (h *Handler) writeMediaResult(c *gin.Context, result *gateway.Result) {
@@ -539,6 +588,91 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成 JSON 请求无效: "+err.Error())
 		return
 	}
+	h.createVideo(c, request, false)
+}
+
+func (h *Handler) generateOpenAIVideo(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || (!strings.EqualFold(mediaType, "application/json") && !strings.EqualFold(mediaType, "multipart/form-data")) {
+		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "OpenAI 兼容视频生成仅支持 application/json 或 multipart/form-data")
+		return
+	}
+	var request openAIVideoGenerationRequest
+	if strings.EqualFold(mediaType, "multipart/form-data") {
+		request, err = parseOpenAIVideoMultipart(c, h.maxBodyBytes)
+	} else {
+		err = decodeSingleJSON(c.Request.Body, &request, false)
+	}
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "视频参考图片超过请求大小限制")
+			return
+		}
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "视频生成请求无效: "+err.Error())
+		return
+	}
+	normalized, err := normalizeOpenAIVideoRequest(request)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	h.createVideo(c, normalized, true)
+}
+
+func parseOpenAIVideoMultipart(c *gin.Context, maxBodyBytes int64) (openAIVideoGenerationRequest, error) {
+	memoryBytes := min(maxBodyBytes, int64(openAIVideoMultipartMemory))
+	if err := c.Request.ParseMultipartForm(memoryBytes); err != nil {
+		return openAIVideoGenerationRequest{}, err
+	}
+	form := c.Request.MultipartForm
+	defer form.RemoveAll()
+	request := openAIVideoGenerationRequest{
+		Model: c.PostForm("model"), Prompt: c.PostForm("prompt"), Size: c.PostForm("size"),
+		Quality: c.PostForm("quality"), AspectRatio: c.PostForm("aspect_ratio"), Resolution: c.PostForm("resolution"),
+	}
+	if value := strings.TrimSpace(c.PostForm("seconds")); value != "" {
+		request.Seconds = json.RawMessage(strconv.Quote(value))
+	}
+	if value := strings.TrimSpace(c.PostForm("duration")); value != "" {
+		request.Duration = json.RawMessage(strconv.Quote(value))
+	}
+	if value := strings.TrimSpace(c.PostForm("input_reference")); value != "" {
+		request.InputReference = value
+	}
+	if values := form.Value["images"]; len(values) > 0 {
+		request.Images = append([]string(nil), values...)
+	}
+	for _, field := range []string{"image", "input_reference"} {
+		files := form.File[field]
+		if len(files) == 0 {
+			continue
+		}
+		file, err := files[0].Open()
+		if err != nil {
+			return openAIVideoGenerationRequest{}, err
+		}
+		fileLimit := min(maxBodyBytes, openAIVideoReferenceMaxBytes)
+		raw, readErr := io.ReadAll(io.LimitReader(file, fileLimit+1))
+		_ = file.Close()
+		if readErr != nil || int64(len(raw)) > fileLimit {
+			return openAIVideoGenerationRequest{}, &http.MaxBytesError{Limit: fileLimit}
+		}
+		mimeType := strings.TrimSpace(strings.Split(http.DetectContentType(raw), ";")[0])
+		if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+			return openAIVideoGenerationRequest{}, fmt.Errorf("input_reference 必须是图片")
+		}
+		if field == "image" {
+			request.ImageFile = &videoGenerationImage{Data: raw}
+		} else {
+			request.InputFile = &videoGenerationImage{Data: raw}
+		}
+	}
+	return request, nil
+}
+
+func (h *Handler) createVideo(c *gin.Context, request videoGenerationRequest, openAICompatible bool) {
 	if hasJSONValue(request.Output) {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前 Grok Web Provider 不支持 output.upload_url")
 		return
@@ -582,20 +716,27 @@ func (h *Handler) generateVideo(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 与 reference_images 合计不能超过 8 张")
 		return
 	}
-	referenceURLs := make([]string, 0, len(inputs))
+	references := make([]gateway.VideoReference, 0, len(inputs))
 	for _, input := range inputs {
 		if strings.TrimSpace(input.FileID) != "" {
 			writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前暂不支持 image.file_id，请使用 image.url")
 			return
 		}
 		urlValue := strings.TrimSpace(input.URL)
-		if urlValue == "" {
+		switch {
+		case urlValue != "" && len(input.Data) != 0:
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 只能提供 url 或文件内容")
+			return
+		case urlValue != "":
+			references = append(references, gateway.VideoReference{URL: urlValue})
+		case len(input.Data) != 0:
+			references = append(references, gateway.VideoReference{Data: input.Data})
+		default:
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 都必须提供有效 url")
 			return
 		}
-		referenceURLs = append(referenceURLs, urlValue)
 	}
-	if prompt == "" && len(referenceURLs) == 0 {
+	if prompt == "" && len(references) == 0 {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "文本生视频必须提供 prompt；图片生视频可以省略 prompt")
 		return
 	}
@@ -606,13 +747,126 @@ func (h *Handler) generateVideo(c *gin.Context) {
 	job, err := h.gateway.CreateVideo(c.Request.Context(), gateway.VideoInput{
 		RequestID: requestID, ClientKey: clientKey, PublicModel: model,
 		Prompt: prompt, Duration: duration, AspectRatio: aspectRatio, Resolution: resolution,
-		ReferenceURLs: referenceURLs,
+		References: references, OpenAICompatible: openAICompatible, ResponseSize: request.ResponseSize,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
 		return
 	}
+	if openAICompatible {
+		c.JSON(http.StatusOK, openAIVideoGenerationResponse(job))
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"request_id": job.ID})
+}
+
+func normalizeOpenAIVideoRequest(request openAIVideoGenerationRequest) (videoGenerationRequest, error) {
+	duration := request.Duration
+	if !hasJSONValue(duration) {
+		duration = request.Seconds
+	}
+	if !hasJSONValue(duration) {
+		duration = json.RawMessage(`4`)
+	}
+	responseSize := strings.ToLower(strings.TrimSpace(request.Size))
+	aspectRatio, resolution, err := resolveOpenAIVideoSize(request.AspectRatio, request.Resolution, responseSize, request.Quality)
+	if err != nil {
+		return videoGenerationRequest{}, err
+	}
+	if responseSize == "" {
+		responseSize = openAIVideoResponseSize(aspectRatio, resolution)
+	}
+	image, err := parseOpenAIVideoImage(request.Image)
+	if err != nil {
+		return videoGenerationRequest{}, err
+	}
+	if request.ImageFile != nil {
+		image = request.ImageFile
+	}
+	references := append([]videoGenerationImage(nil), request.ReferenceImages...)
+	if request.InputFile != nil {
+		references = append(references, *request.InputFile)
+	} else if value := strings.TrimSpace(request.InputReference); value != "" {
+		references = append(references, videoGenerationImage{URL: value})
+	}
+	for _, value := range request.Images {
+		if value = strings.TrimSpace(value); value != "" {
+			references = append(references, videoGenerationImage{URL: value})
+		}
+	}
+	return videoGenerationRequest{
+		Model: request.Model, Prompt: request.Prompt, User: request.User, Duration: duration,
+		AspectRatio: aspectRatio, Resolution: resolution, Image: image, ReferenceImages: references,
+		Output: request.Output, StorageOptions: request.StorageOptions, ResponseSize: responseSize,
+	}, nil
+}
+
+func openAIVideoResponseSize(aspectRatio, resolution string) string {
+	aspectRatio = strings.ToLower(strings.TrimSpace(aspectRatio))
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	if resolution == "" {
+		resolution = "720p"
+	}
+	if value := map[string]string{
+		"16:9/480p": "854x480", "9:16/480p": "480x854",
+		"16:9/720p": "1280x720", "9:16/720p": "720x1280",
+		"16:9/1080p": "1920x1080", "9:16/1080p": "1080x1920",
+		"1:1/480p": "480x480", "1:1/720p": "720x720", "1:1/1080p": "1024x1024",
+	}[aspectRatio+"/"+resolution]; value != "" {
+		return value
+	}
+	return aspectRatio
+}
+
+func parseOpenAIVideoImage(raw json.RawMessage) (*videoGenerationImage, error) {
+	if !hasJSONValue(raw) {
+		return nil, nil
+	}
+	var value string
+	if json.Unmarshal(raw, &value) == nil {
+		if value = strings.TrimSpace(value); value != "" {
+			return &videoGenerationImage{URL: value}, nil
+		}
+		return nil, nil
+	}
+	var image videoGenerationImage
+	if json.Unmarshal(raw, &image) != nil || (strings.TrimSpace(image.URL) == "" && strings.TrimSpace(image.FileID) == "") {
+		return nil, fmt.Errorf("image 必须是图片 URL 或包含 url 的对象")
+	}
+	return &image, nil
+}
+
+func resolveOpenAIVideoSize(aspectRatio, resolution, size, quality string) (string, string, error) {
+	aspectRatio = strings.ToLower(strings.TrimSpace(aspectRatio))
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	quality = strings.ToLower(strings.TrimSpace(quality))
+	if resolution == "" && quality != "" {
+		resolution = quality
+	}
+	if size = strings.ToLower(strings.TrimSpace(size)); size != "" {
+		type videoSpec struct{ aspectRatio, resolution string }
+		specs := map[string]videoSpec{
+			"1:1": {"1:1", ""}, "16:9": {"16:9", ""}, "9:16": {"9:16", ""}, "4:3": {"4:3", ""}, "3:4": {"3:4", ""}, "3:2": {"3:2", ""}, "2:3": {"2:3", ""},
+			"854x480": {"16:9", "480p"}, "480x854": {"9:16", "480p"},
+			"1280x720": {"16:9", "720p"}, "720x1280": {"9:16", "720p"},
+			"1792x1024": {"16:9", "1080p"}, "1024x1792": {"9:16", "1080p"},
+			"1920x1080": {"16:9", "1080p"}, "1080x1920": {"9:16", "1080p"}, "1024x1024": {"1:1", "1080p"},
+		}
+		spec, ok := specs[size]
+		if !ok {
+			return "", "", fmt.Errorf("size 不受支持")
+		}
+		if aspectRatio == "" {
+			aspectRatio = spec.aspectRatio
+		}
+		if resolution == "" {
+			resolution = spec.resolution
+		}
+	}
+	if aspectRatio == "" {
+		aspectRatio = "9:16"
+	}
+	return aspectRatio, resolution, nil
 }
 
 func (h *Handler) getVideo(c *gin.Context) {
@@ -625,7 +879,12 @@ func (h *Handler) getVideo(c *gin.Context) {
 		writeGatewayError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, videoGenerationResponse(job, h.videoContentURL(job.ID)))
+	contentURL := h.videoContentURL(job.ID)
+	if openAICompatible, _ := gateway.VideoJobResponseMetadata(job); openAICompatible {
+		c.JSON(http.StatusOK, openAIVideoGenerationResponse(job))
+		return
+	}
+	c.JSON(http.StatusOK, videoGenerationResponse(job, contentURL))
 }
 
 func (h *Handler) videoContentURL(jobID string) string {
@@ -763,6 +1022,34 @@ func videoGenerationResponse(job mediadomain.Job, contentURLs ...string) gin.H {
 	default:
 		return gin.H{"status": "pending", "model": job.Model, "progress": min(99, max(0, job.Progress))}
 	}
+}
+
+func openAIVideoGenerationResponse(job mediadomain.Job) gin.H {
+	_, responseSize := gateway.VideoJobResponseMetadata(job)
+	if responseSize == "" {
+		responseSize = job.Size
+	}
+	response := gin.H{
+		"id": job.ID, "object": "video", "model": job.Model,
+		"progress": min(100, max(0, job.Progress)), "created_at": job.CreatedAt.Unix(),
+		"seconds": strconv.Itoa(job.Seconds), "size": responseSize,
+	}
+	switch job.Status {
+	case mediadomain.StatusCompleted:
+		response["status"], response["progress"] = "completed", 100
+		if job.CompletedAt != nil {
+			response["completed_at"] = job.CompletedAt.Unix()
+		}
+	case mediadomain.StatusFailed:
+		response["status"] = "failed"
+		response["error"] = gin.H{"code": officialVideoErrorCode(job.ErrorCode), "message": job.ErrorMessage}
+	case mediadomain.StatusInProgress:
+		response["status"] = "in_progress"
+	default:
+		response["status"] = "queued"
+		response["progress"] = min(99, max(0, job.Progress))
+	}
+	return response
 }
 
 func officialVideoErrorCode(value string) string {
@@ -1278,6 +1565,15 @@ func writeGatewayError(c *gin.Context, err error) {
 	case errors.Is(err, gateway.ErrModelNotFound):
 		status, code = http.StatusNotFound, "model_not_found"
 		message = "模型不存在"
+	case errors.Is(err, gateway.ErrVideoInputTooLarge):
+		status, code = http.StatusRequestEntityTooLarge, "request_too_large"
+		message = "视频参考图片元数据超过任务持久化上限"
+	case errors.Is(err, mediaapp.ErrImageTooLarge):
+		status, code = http.StatusRequestEntityTooLarge, "request_too_large"
+		message = "视频参考图片超过媒体大小限制"
+	case errors.Is(err, mediaapp.ErrInvalidImage):
+		status, code = http.StatusBadRequest, "invalid_request"
+		message = "视频参考图片无效"
 	case errors.Is(err, gateway.ErrResponseNotFound):
 		status, code = http.StatusNotFound, "response_not_found"
 		message = "Response 不存在或已过期"

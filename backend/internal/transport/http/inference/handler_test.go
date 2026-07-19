@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"image"
+	"image/png"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -79,10 +83,15 @@ func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 		t.Fatalf("wrong content type status=%d body=%s", wrongContentTypeRecorder.Code, wrongContentTypeRecorder.Body.String())
 	}
 
-	unsupportedRecorder := httptest.NewRecorder()
-	router.ServeHTTP(unsupportedRecorder, httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{}`)))
-	if unsupportedRecorder.Code != http.StatusNotFound {
-		t.Fatalf("unsupported video endpoint status=%d", unsupportedRecorder.Code)
+	compatible := httptest.NewRequest(http.MethodPost, "/v1/videos", strings.NewReader(`{
+		"model":"grok-imagine-video","prompt":"test","seconds":"8",
+		"size":"1280x720","quality":"720p","input_reference":"https://example.com/input.png"
+	}`))
+	compatible.Header.Set("Content-Type", "application/json")
+	compatibleRecorder := httptest.NewRecorder()
+	router.ServeHTTP(compatibleRecorder, compatible)
+	if compatibleRecorder.Code != http.StatusUnauthorized || !strings.Contains(compatibleRecorder.Body.String(), "invalid_api_key") {
+		t.Fatalf("compatible video endpoint status=%d body=%s", compatibleRecorder.Code, compatibleRecorder.Body.String())
 	}
 	contentRecorder := httptest.NewRecorder()
 	router.ServeHTTP(contentRecorder, httptest.NewRequest(http.MethodGet, "/v1/videos/request_1/content", nil))
@@ -133,6 +142,16 @@ func TestGatewayErrorDoesNotExposeInternalDetails(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 	if recorder.Code != http.StatusBadGateway || strings.Contains(recorder.Body.String(), "postgres") || !strings.Contains(recorder.Body.String(), "上游服务暂不可用") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestGatewayVideoInputTooLargeReturnsRequestError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	writeGatewayError(context, gateway.ErrVideoInputTooLarge)
+	if recorder.Code != http.StatusRequestEntityTooLarge || !strings.Contains(recorder.Body.String(), `"code":"request_too_large"`) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
@@ -284,29 +303,176 @@ func TestJSONInferenceEndpointsRejectWrongMediaTypeAndTrailingDocument(t *testin
 	}
 }
 
-func TestVideoDurationUsesOfficialFieldOnly(t *testing.T) {
+func TestVideoDurationSupportsOpenAICompatibleSeconds(t *testing.T) {
 	if value, err := parseVideoDuration(nil); err != nil || value != 8 {
 		t.Fatalf("default duration=%d err=%v", value, err)
 	}
 	if value, err := parseVideoDuration(json.RawMessage(`"6"`)); err != nil || value != 6 {
 		t.Fatalf("duration=%d err=%v", value, err)
 	}
+	normalized, err := normalizeOpenAIVideoRequest(openAIVideoGenerationRequest{Seconds: json.RawMessage(`"9"`)})
+	if err != nil || string(normalized.Duration) != `"9"` || normalized.AspectRatio != "9:16" || normalized.ResponseSize != "720x1280" {
+		t.Fatalf("normalized duration=%s err=%v", normalized.Duration, err)
+	}
+	defaultRequest, err := normalizeOpenAIVideoRequest(openAIVideoGenerationRequest{})
+	if err != nil || string(defaultRequest.Duration) != `4` || defaultRequest.AspectRatio != "9:16" {
+		t.Fatalf("default request=%#v err=%v", defaultRequest, err)
+	}
+	landscape, err := normalizeOpenAIVideoRequest(openAIVideoGenerationRequest{AspectRatio: "16:9", Resolution: "720p"})
+	if err != nil || landscape.ResponseSize != "1280x720" {
+		t.Fatalf("landscape request=%#v err=%v", landscape, err)
+	}
+	portrait1080, err := normalizeOpenAIVideoRequest(openAIVideoGenerationRequest{AspectRatio: "9:16", Resolution: "1080p"})
+	if err != nil || portrait1080.ResponseSize != "1080x1920" {
+		t.Fatalf("portrait request=%#v err=%v", portrait1080, err)
+	}
 }
 
-func TestVideoGenerationResponseMatchesOfficialPollingShape(t *testing.T) {
-	now := time.Now().UTC()
+func TestOpenAIVideoRequestCompatibility(t *testing.T) {
+	normalized, err := normalizeOpenAIVideoRequest(openAIVideoGenerationRequest{
+		Model: "grok-imagine-video", Prompt: "test", Seconds: json.RawMessage(`8`), Size: "1280x720",
+		Image:  json.RawMessage(`"https://example.com/image.png"`),
+		Images: []string{"https://example.com/second.png"}, InputReference: "https://example.com/third.png",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.AspectRatio != "16:9" || normalized.Resolution != "720p" || normalized.ResponseSize != "1280x720" || normalized.Image == nil || normalized.Image.URL != "https://example.com/image.png" {
+		t.Fatalf("normalized request=%#v", normalized)
+	}
+	if len(normalized.ReferenceImages) != 2 || normalized.ReferenceImages[0].URL != "https://example.com/third.png" || normalized.ReferenceImages[1].URL != "https://example.com/second.png" {
+		t.Fatalf("references=%#v", normalized.ReferenceImages)
+	}
+	if _, _, err := resolveOpenAIVideoSize("", "", "unsupported", ""); err == nil {
+		t.Fatal("unsupported size was accepted")
+	}
+}
+
+func TestOpenAIVideoMultipartCompatibility(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "grok-imagine-video")
+	_ = writer.WriteField("prompt", "test")
+	_ = writer.WriteField("seconds", "8")
+	_ = writer.WriteField("size", "1280x720")
+	part, err := writer.CreateFormFile("input_reference", "reference.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("\x89PNG\r\n\x1a\n"))
+	_ = writer.Close()
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", &body)
+	context.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	request, err := parseOpenAIVideoMultipart(context, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := normalizeOpenAIVideoRequest(request)
+	if err != nil || normalized.AspectRatio != "16:9" || normalized.Resolution != "720p" || len(normalized.ReferenceImages) != 1 || !bytes.Equal(normalized.ReferenceImages[0].Data, []byte("\x89PNG\r\n\x1a\n")) || normalized.ReferenceImages[0].URL != "" {
+		t.Fatalf("normalized=%#v err=%v", normalized, err)
+	}
+}
+
+func TestOpenAIVideoMultipartLargeReferenceStaysRaw(t *testing.T) {
+	for _, size := range []int{900 << 10, 5 << 20} {
+		t.Run(fmt.Sprintf("%d_bytes", size), func(t *testing.T) {
+			raw := makeVideoTestPNG(t, size)
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			_ = writer.WriteField("model", "grok-imagine-video")
+			part, err := writer.CreateFormFile("input_reference", "reference.png")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _ = part.Write(raw)
+			_ = writer.Close()
+
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Request = httptest.NewRequest(http.MethodPost, "/v1/videos", &body)
+			context.Request.Header.Set("Content-Type", writer.FormDataContentType())
+			request, err := parseOpenAIVideoMultipart(context, 8<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			normalized, err := normalizeOpenAIVideoRequest(request)
+			if err != nil || len(normalized.ReferenceImages) != 1 || !bytes.Equal(normalized.ReferenceImages[0].Data, raw) || len(raw) < size || normalized.ReferenceImages[0].URL != "" {
+				t.Fatalf("normalized data=%d err=%v", len(normalized.ReferenceImages[0].Data), err)
+			}
+		})
+	}
+}
+
+func TestOpenAIVideoMultipartOversizeReturns413(t *testing.T) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "grok-imagine-video")
+	part, err := writer.CreateFormFile("input_reference", "reference.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write(makeVideoTestPNG(t, 2<<20))
+	_ = writer.Close()
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	NewHandler(nil, nil, 1<<20).Register(router.Group("/v1"))
+	request := httptest.NewRequest(http.MethodPost, "/v1/videos", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusRequestEntityTooLarge || !strings.Contains(recorder.Body.String(), `"code":"request_too_large"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func makeVideoTestPNG(t *testing.T, minimumBytes int) []byte {
+	t.Helper()
+	const width = 1024
+	height := max(1, (minimumBytes+width-1)/width)
+	value := image.NewGray(image.Rect(0, 0, width, height))
+	for index := range value.Pix {
+		value.Pix[index] = byte(index*31 + index/251)
+	}
+	var encoded bytes.Buffer
+	encoder := png.Encoder{CompressionLevel: png.NoCompression}
+	if err := encoder.Encode(&encoded, value); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := png.Decode(bytes.NewReader(encoded.Bytes())); err != nil {
+		t.Fatalf("generated PNG is invalid: %v", err)
+	}
+	return encoded.Bytes()
+}
+
+func TestVideoGenerationResponseKeepsNativePollingShape(t *testing.T) {
 	pending := videoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusInProgress, Progress: 42})
-	if pending["status"] != "pending" || pending["progress"] != 42 || pending["model"] != "grok-imagine-video" || pending["video"] != nil {
+	if pending["status"] != "pending" || pending["progress"] != 42 || pending["model"] != "grok-imagine-video" {
 		t.Fatalf("pending response=%#v", pending)
 	}
-	done := videoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusCompleted, Progress: 100, Seconds: 8, UpstreamURL: "https://assets.grok.com/video.mp4", CompletedAt: &now})
-	video, ok := done["video"].(gin.H)
-	if done["status"] != "done" || done["progress"] != 100 || !ok || video["url"] != "https://assets.grok.com/video.mp4" || video["duration"] != 8 || video["respect_moderation"] != true {
+	done := videoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusCompleted, Seconds: 8, UpstreamURL: "https://assets.grok.com/video.mp4"})
+	if done["status"] != "done" || done["progress"] != 100 {
 		t.Fatalf("done response=%#v", done)
 	}
-	failed := videoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "account_unavailable", ErrorMessage: "try later"})
+}
+
+func TestOpenAIVideoGenerationResponseMatchesNewAPIPollingShape(t *testing.T) {
+	now := time.Now().UTC()
+	pending := openAIVideoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusInProgress, Progress: 42})
+	if pending["status"] != "in_progress" || pending["progress"] != 42 || pending["model"] != "grok-imagine-video" || pending["object"] != "video" || pending["video"] != nil {
+		t.Fatalf("pending response=%#v", pending)
+	}
+	done := openAIVideoGenerationResponse(mediadomain.Job{ID: "video_oai_test", Model: "grok-imagine-video", Status: mediadomain.StatusCompleted, Progress: 100, Seconds: 8, Size: "16:9", InputJSON: `{"response_protocol":"openai","response_size":"1280x720"}`, UpstreamURL: "https://assets.grok.com/video.mp4", CreatedAt: now.Add(-time.Minute), CompletedAt: &now})
+	if done["id"] != "video_oai_test" || done["task_id"] != nil || done["status"] != "completed" || done["progress"] != 100 || done["completed_at"] != now.Unix() || done["size"] != "1280x720" || done["video"] != nil {
+		t.Fatalf("done response=%#v", done)
+	}
+	failed := openAIVideoGenerationResponse(mediadomain.Job{Status: mediadomain.StatusFailed, ErrorCode: "account_unavailable", ErrorMessage: "try later"})
 	errorValue, ok := failed["error"].(gin.H)
-	if failed["status"] != "failed" || !ok || errorValue["code"] != "service_unavailable" || failed["model"] != nil || failed["progress"] != nil {
+	if failed["status"] != "failed" || !ok || errorValue["code"] != "service_unavailable" {
 		t.Fatalf("failed response=%#v", failed)
 	}
 }
@@ -340,6 +506,48 @@ func TestImageGenerationEndpointValidatesXAIContractBeforeRouting(t *testing.T) 
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/image", strings.NewReader(`{}`)))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("singular image endpoint status = %d", recorder.Code)
+	}
+}
+
+func TestResolveOpenAIImageResolution(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		resolution string
+		quality    string
+		want       string
+		wantErr    bool
+	}{
+		{name: "default", want: ""},
+		{name: "standard", quality: "standard", want: "1k"},
+		{name: "auto", quality: "AUTO", want: "1k"},
+		{name: "high", quality: "high", want: "2k"},
+		{name: "hd", quality: "HD", want: "2k"},
+		{name: "explicit resolution wins", resolution: "2K", quality: "low", want: "2k"},
+		{name: "unsupported", quality: "ultra", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := resolveOpenAIImageResolution(test.resolution, test.quality)
+			if (err != nil) != test.wantErr || got != test.want {
+				t.Fatalf("resolution=%q err=%v, want=%q wantErr=%t", got, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestImageGenerationAcceptsOpenAIQuality(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	NewHandler(nil, nil, 1<<20).Register(router.Group("/v1"))
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"model":"grok-imagine-image-quality","prompt":"cat","n":1,
+		"size":"1024x1024","quality":"high","response_format":"url"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusUnauthorized || !strings.Contains(recorder.Body.String(), "invalid_api_key") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 

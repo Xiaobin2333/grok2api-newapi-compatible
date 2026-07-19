@@ -2,11 +2,13 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,24 +28,48 @@ const (
 	videoJobLease            = videoJobTimeout + 5*time.Minute
 	videoJobRecoveryInterval = 30 * time.Second
 	videoOutputAttempts      = 3
+	maxVideoInputJSONBytes   = 1 << 20
 )
 
+type VideoReference struct {
+	URL  string
+	Data []byte
+}
+
 type VideoInput struct {
-	RequestID     string
-	ClientKey     clientkey.Key
-	PublicModel   string
-	Prompt        string
-	Duration      int
-	AspectRatio   string
-	Resolution    string
-	ReferenceURLs []string
+	RequestID   string
+	ClientKey   clientkey.Key
+	PublicModel string
+	Prompt      string
+	Duration    int
+	AspectRatio string
+	Resolution  string
+	References  []VideoReference
+	// ReferenceURLs 保留给既有内部调用方；新调用使用 References 保持混合输入顺序。
+	ReferenceURLs    []string
+	OpenAICompatible bool
+	ResponseSize     string
+}
+
+type videoInputReference struct {
+	URL     string `json:"url,omitempty"`
+	AssetID string `json:"asset_id,omitempty"`
+}
+
+type videoInputMetadata struct {
+	// ImageURLs 只用于恢复旧版本任务。
+	ImageURLs        []string              `json:"image_urls,omitempty"`
+	References       []videoInputReference `json:"references,omitempty"`
+	ResponseProtocol string                `json:"response_protocol,omitempty"`
+	ResponseSize     string                `json:"response_size,omitempty"`
 }
 
 func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job, error) {
 	if s.mediaJobs == nil || s.mediaQueue == nil {
 		return media.Job{}, fmt.Errorf("视频任务服务未配置")
 	}
-	if len(input.Prompt) > 100000 || (len(input.Prompt) == 0 && len(input.ReferenceURLs) == 0) {
+	references := orderedVideoReferences(input)
+	if len(input.Prompt) > 100000 || (len(input.Prompt) == 0 && len(references) == 0) {
 		return media.Job{}, fmt.Errorf("文本生视频必须提供 prompt；图片生视频可以省略 prompt")
 	}
 	routes, err := s.models.GetByPublicIDCandidates(ctx, input.PublicModel)
@@ -69,14 +95,28 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, err
 	}
+	inputJSON, inputAssetIDs, err := s.prepareVideoInput(ctx, references, input.OpenAICompatible, input.ResponseSize)
+	if err != nil {
+		return media.Job{}, err
+	}
+	inputsCommitted := false
+	defer func() {
+		if !inputsCommitted {
+			s.deleteVideoInputImages(ctx, inputAssetIDs)
+		}
+	}()
 	now := time.Now().UTC()
+	idPrefix := "video_"
+	if input.OpenAICompatible {
+		idPrefix = "video_oai_"
+	}
 	job := media.Job{
-		ID: "video_" + token, RequestID: input.RequestID,
+		ID: idPrefix + token, RequestID: input.RequestID,
 		ClientKeyID: input.ClientKey.ID, ClientKeyName: input.ClientKey.Name,
 		AccountID: accountID, AccountName: lease.Credential.Name,
 		Provider: string(route.Provider), Model: externalModel, ModelRouteID: route.ID, UpstreamModel: model.DisplayUpstreamModel(route.Provider, route.UpstreamModel), Prompt: input.Prompt,
 		Seconds: input.Duration, Size: input.AspectRatio, Quality: input.Resolution,
-		Status: media.StatusQueued, Progress: 0, InputJSON: encodeVideoInput(input.ReferenceURLs), CreatedAt: now, UpdatedAt: now,
+		Status: media.StatusQueued, Progress: 0, InputJSON: inputJSON, InputAssetIDs: inputAssetIDs, CreatedAt: now, UpdatedAt: now,
 	}
 	reserved := false
 	if pricing, ok := audit.EstimateOfficialVideoCost(externalModel, input.Resolution, input.Duration); ok {
@@ -91,6 +131,7 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 		}
 		return media.Job{}, err
 	}
+	inputsCommitted = true
 	if !s.enqueueVideoJob(job.ID) {
 		s.logger.Warn("video_job_queue_full", "job_id", job.ID)
 	}
@@ -281,6 +322,15 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	if err := s.mediaJobs.UpdateMediaJob(ctx, job); err != nil {
 		s.logger.Warn("video_job_progress_write_failed", "job_id", job.ID, "error", err)
 	}
+	referenceURLs, err := s.resolveVideoReferences(ctx, decodeVideoInput(job.InputJSON))
+	if err != nil {
+		if parent.Err() != nil {
+			s.deferVideoJob(parent, job)
+			return
+		}
+		s.failVideoJob(parent, job, "input_unavailable", fmt.Errorf("读取视频参考图片: %w", err))
+		return
+	}
 	// 视频任务创建时已持久化账号归属；恢复只能重新获取原账号，禁止因后续
 	// 轮询或结果处理失败切换到其他账号。
 	lease, err := s.selector.AcquirePinned(ctx, route.Provider, job.AccountID, route.UpstreamModel, "", true)
@@ -301,7 +351,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	lastProgress := job.Progress
 	result, err := adapter.GenerateVideo(ctx, provider.VideoRequest{
 		Credential: lease.Credential, Billing: lease.Billing, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
-		ReferenceURLs: decodeVideoInput(job.InputJSON),
+		ReferenceURLs: referenceURLs,
 		Progress: func(value int) {
 			value = min(99, max(1, value))
 			if value-lastProgress < 5 {
@@ -327,9 +377,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
 		if errors.Is(err, provider.ErrUnauthorized) {
-			if lease.Credential.AuthType == account.AuthTypeSSO {
-				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
-			}
+			s.handleVideoCredentialRejected(failureCtx, lease.Credential)
 			failureHandled = true
 		} else if status, ok := provider.ErrorHTTPStatus(err); ok {
 			switch {
@@ -395,6 +443,14 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 	if quotaKind, _ := s.providers.QuotaKind(route.Provider); quotaKind == provider.QuotaRemoteWindow && lease.QuotaMode == "weekly" {
 		s.accounts.QueueQuotaRefresh(job.AccountID, lease.QuotaMode)
 	}
+}
+
+func (s *Service) handleVideoCredentialRejected(ctx context.Context, credential account.Credential) {
+	if credential.AuthType == account.AuthTypeSSO {
+		s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+		return
+	}
+	s.selector.MarkFailure(ctx, credential, http.StatusUnauthorized, 0)
 }
 
 // persistRemoteVideo 只重试已经生成的视频结果下载与本地归档，不重新调用生成接口，
@@ -488,7 +544,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		Provider: job.Provider, Operation: audit.OperationVideo, UsageSource: audit.UsageSourceNone,
 		AccountID: accountID, AccountName: job.AccountName, StatusCode: statusCode, ErrorCode: job.ErrorCode,
 		EgressNodeID: job.EgressNodeID, EgressNodeName: job.EgressNodeName, EgressScope: job.EgressScope, EgressMode: audit.EgressMode(job.EgressMode),
-		MediaInputImages: int64(len(decodeVideoInput(job.InputJSON))),
+		MediaInputImages: int64(videoInputReferenceCount(decodeVideoInput(job.InputJSON))),
 		DurationMS:       durationMS, CreatedAt: createdAt,
 	}
 	if job.Status == media.StatusCompleted {
@@ -513,15 +569,173 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 	return s.mediaJobs.MarkMediaJobUsageRecorded(markCtx, job.ID, time.Now().UTC())
 }
 
-func encodeVideoInput(referenceURLs []string) string {
-	data, _ := json.Marshal(map[string][]string{"image_urls": referenceURLs})
+func encodeVideoInput(referenceURLs []string, openAICompatible bool, responseSize string) string {
+	references := make([]videoInputReference, 0, len(referenceURLs))
+	for _, referenceURL := range referenceURLs {
+		references = append(references, videoInputReference{URL: referenceURL})
+	}
+	return encodeVideoInputReferences(references, openAICompatible, responseSize)
+}
+
+func encodeVideoInputReferences(references []videoInputReference, openAICompatible bool, responseSize string) string {
+	responseProtocol := "xai"
+	if openAICompatible {
+		responseProtocol = "openai"
+	}
+	data, _ := json.Marshal(videoInputMetadata{
+		References: references, ResponseProtocol: responseProtocol, ResponseSize: responseSize,
+	})
 	return string(data)
 }
 
-func decodeVideoInput(value string) []string {
-	var input map[string][]string
+func decodeVideoInput(value string) videoInputMetadata {
+	var input videoInputMetadata
 	_ = json.Unmarshal([]byte(value), &input)
-	return input["image_urls"]
+	if len(input.References) == 0 && len(input.ImageURLs) > 0 {
+		input.References = make([]videoInputReference, 0, len(input.ImageURLs))
+		for _, imageURL := range input.ImageURLs {
+			input.References = append(input.References, videoInputReference{URL: imageURL})
+		}
+	}
+	return input
+}
+
+func orderedVideoReferences(input VideoInput) []VideoReference {
+	references := append([]VideoReference(nil), input.References...)
+	for _, referenceURL := range input.ReferenceURLs {
+		references = append(references, VideoReference{URL: referenceURL})
+	}
+	return references
+}
+
+func (s *Service) prepareVideoInput(ctx context.Context, references []VideoReference, openAICompatible bool, responseSize string) (string, []string, error) {
+	persisted, assetIDs, err := s.stageVideoReferences(ctx, references)
+	if err != nil {
+		return "", nil, err
+	}
+	inputJSON := encodeVideoInputReferences(persisted, openAICompatible, responseSize)
+	if len(inputJSON) > maxVideoInputJSONBytes {
+		s.deleteVideoInputImages(ctx, assetIDs)
+		return "", nil, ErrVideoInputTooLarge
+	}
+	return inputJSON, assetIDs, nil
+}
+
+func (s *Service) stageVideoReferences(ctx context.Context, references []VideoReference) ([]videoInputReference, []string, error) {
+	persisted := make([]videoInputReference, 0, len(references))
+	assetIDs := make([]string, 0, len(references))
+	fail := func(err error) ([]videoInputReference, []string, error) {
+		s.deleteVideoInputImages(ctx, assetIDs)
+		return nil, nil, err
+	}
+	for _, reference := range references {
+		referenceURL := strings.TrimSpace(reference.URL)
+		switch {
+		case referenceURL != "" && len(reference.Data) != 0:
+			return fail(fmt.Errorf("视频参考图片不能同时提供 URL 和文件内容"))
+		case referenceURL != "":
+			persisted = append(persisted, videoInputReference{URL: referenceURL})
+		case len(reference.Data) != 0:
+			if s.mediaAssets == nil {
+				return fail(fmt.Errorf("视频输入图片存储未配置"))
+			}
+			asset, err := s.mediaAssets.SaveVideoInputImage(ctx, reference.Data)
+			if err != nil {
+				return fail(err)
+			}
+			if strings.TrimSpace(asset.ID) == "" {
+				return fail(fmt.Errorf("保存视频输入图片后未返回资源 ID"))
+			}
+			assetIDs = append(assetIDs, asset.ID)
+			persisted = append(persisted, videoInputReference{AssetID: asset.ID})
+		default:
+			return fail(fmt.Errorf("视频参考图片不能为空"))
+		}
+	}
+	return persisted, assetIDs, nil
+}
+
+func (s *Service) deleteVideoInputImages(ctx context.Context, assetIDs []string) {
+	if s.mediaAssets == nil {
+		return
+	}
+	deleteCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+	defer cancel()
+	for _, assetID := range assetIDs {
+		if err := s.mediaAssets.DeleteVideoInputImage(deleteCtx, assetID); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("video_input_rollback_failed", "asset_id", assetID, "error", err)
+			}
+		}
+	}
+}
+
+func (s *Service) resolveVideoReferences(ctx context.Context, input videoInputMetadata) ([]string, error) {
+	references := make([]string, 0, len(input.References))
+	for _, reference := range input.References {
+		referenceURL := strings.TrimSpace(reference.URL)
+		assetID := strings.TrimSpace(reference.AssetID)
+		switch {
+		case referenceURL != "" && assetID != "":
+			return nil, fmt.Errorf("视频参考图片元数据无效")
+		case referenceURL != "":
+			references = append(references, referenceURL)
+		case assetID != "":
+			dataURL, err := s.videoInputAssetDataURL(ctx, assetID)
+			if err != nil {
+				return nil, err
+			}
+			references = append(references, dataURL)
+		default:
+			return nil, fmt.Errorf("视频参考图片元数据为空")
+		}
+	}
+	return references, nil
+}
+
+func (s *Service) videoInputAssetDataURL(ctx context.Context, assetID string) (string, error) {
+	if s.mediaAssets == nil {
+		return "", fmt.Errorf("视频输入图片存储未配置")
+	}
+	asset, body, err := s.mediaAssets.OpenInternalImage(ctx, assetID)
+	if err != nil {
+		return "", err
+	}
+	defer body.Close()
+	const maxStoredImageBytes = int64(32 << 20)
+	if asset.SizeBytes <= 0 || asset.SizeBytes > maxStoredImageBytes {
+		return "", fmt.Errorf("视频输入图片大小无效")
+	}
+	raw, err := io.ReadAll(io.LimitReader(body, maxStoredImageBytes+1))
+	if err != nil || len(raw) == 0 || int64(len(raw)) > maxStoredImageBytes {
+		return "", fmt.Errorf("读取视频输入图片失败或图片超过 %d MiB", maxStoredImageBytes>>20)
+	}
+	if int64(len(raw)) != asset.SizeBytes {
+		return "", fmt.Errorf("视频输入图片大小与元数据不一致")
+	}
+	mimeType := strings.ToLower(strings.TrimSpace(strings.Split(asset.MIMEType, ";")[0]))
+	switch mimeType {
+	case "image/jpeg", "image/png", "image/webp", "image/gif":
+	default:
+		return "", fmt.Errorf("视频输入资源不是图片")
+	}
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
+}
+
+func videoInputReferenceCount(input videoInputMetadata) int {
+	return len(input.References)
+}
+
+func VideoJobResponseMetadata(job media.Job) (openAICompatible bool, responseSize string) {
+	input := decodeVideoInput(job.InputJSON)
+	switch input.ResponseProtocol {
+	case "openai":
+		return true, input.ResponseSize
+	case "xai":
+		return false, input.ResponseSize
+	default:
+		return strings.HasPrefix(job.ID, "video_oai_"), input.ResponseSize
+	}
 }
 
 func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, err error) {

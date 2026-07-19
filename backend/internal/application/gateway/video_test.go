@@ -1,10 +1,14 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,9 +16,140 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
+
+func TestVideoInputJSONLimitMatchesPersistenceConstraint(t *testing.T) {
+	withinLimit := encodeVideoInput([]string{strings.Repeat("a", maxVideoInputJSONBytes-96)}, true, "1280x720")
+	if len(withinLimit) > maxVideoInputJSONBytes {
+		t.Fatalf("within-limit fixture encoded to %d bytes", len(withinLimit))
+	}
+	overLimit := encodeVideoInput([]string{strings.Repeat("a", maxVideoInputJSONBytes)}, true, "1280x720")
+	if len(overLimit) <= maxVideoInputJSONBytes {
+		t.Fatalf("over-limit fixture encoded to %d bytes", len(overLimit))
+	}
+}
+
+func TestVideoInputMetadataStoresLargeUploadAsCompactAssetReference(t *testing.T) {
+	raw := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x7f}, 900<<10)...)
+	assets := newVideoAssetStoreStub()
+	service := &Service{mediaAssets: assets, logger: slog.Default()}
+	inputJSON, assetIDs, err := service.prepareVideoInput(context.Background(), []VideoReference{{Data: raw}}, true, "1280x720")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assetIDs) != 1 || len(inputJSON) >= 1024 || strings.Contains(inputJSON, "data:image") || strings.Contains(inputJSON, base64.StdEncoding.EncodeToString(raw[:64])) {
+		t.Fatalf("assetIDs=%#v input bytes=%d input=%s", assetIDs, len(inputJSON), inputJSON)
+	}
+	decoded := decodeVideoInput(inputJSON)
+	if len(decoded.References) != 1 || decoded.References[0].AssetID != assetIDs[0] || len(decoded.ImageURLs) != 0 {
+		t.Fatalf("decoded=%#v", decoded)
+	}
+}
+
+func TestPrepareVideoInputRollsBackSavedAssetsWhenMetadataIsTooLarge(t *testing.T) {
+	assets := newVideoAssetStoreStub()
+	service := &Service{mediaAssets: assets, logger: slog.Default()}
+	_, assetIDs, err := service.prepareVideoInput(context.Background(), []VideoReference{
+		{Data: []byte("image")},
+		{URL: "https://example.com/" + strings.Repeat("x", maxVideoInputJSONBytes)},
+	}, true, "1280x720")
+	if !errors.Is(err, ErrVideoInputTooLarge) || len(assetIDs) != 0 {
+		t.Fatalf("assetIDs=%#v err=%v", assetIDs, err)
+	}
+	if len(assets.deleted) != 1 || len(assets.images) != 0 {
+		t.Fatalf("deleted=%#v remaining=%#v", assets.deleted, assets.images)
+	}
+}
+
+func TestStageVideoReferencesRollsBackPartialSave(t *testing.T) {
+	assets := newVideoAssetStoreStub()
+	assets.saveErrorAt = 2
+	service := &Service{mediaAssets: assets, logger: slog.Default()}
+	_, _, err := service.stageVideoReferences(context.Background(), []VideoReference{{Data: []byte("first")}, {Data: []byte("second")}})
+	if err == nil || len(assets.deleted) != 1 || len(assets.images) != 0 {
+		t.Fatalf("error=%v deleted=%#v remaining=%#v", err, assets.deleted, assets.images)
+	}
+}
+
+func TestResolveVideoReferencesPreservesLegacyAndAssetOrder(t *testing.T) {
+	assets := newVideoAssetStoreStub()
+	assets.images["img_local"] = storedVideoInputImage{asset: media.Asset{ID: "img_local", Kind: "image", MIMEType: "image/png", SizeBytes: 3}, data: []byte("png")}
+	service := &Service{mediaAssets: assets}
+	references, err := service.resolveVideoReferences(context.Background(), videoInputMetadata{References: []videoInputReference{
+		{URL: "https://example.com/first.png"}, {AssetID: "img_local"}, {URL: "https://example.com/third.png"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(references) != 3 || references[0] != "https://example.com/first.png" || references[2] != "https://example.com/third.png" || references[1] != "data:image/png;base64,"+base64.StdEncoding.EncodeToString([]byte("png")) {
+		t.Fatalf("references=%#v", references)
+	}
+	legacy := decodeVideoInput(`{"image_urls":["https://example.com/legacy.png"]}`)
+	legacyReferences, err := (&Service{}).resolveVideoReferences(context.Background(), legacy)
+	if err != nil || len(legacyReferences) != 1 || legacyReferences[0] != "https://example.com/legacy.png" {
+		t.Fatalf("legacy=%#v err=%v", legacyReferences, err)
+	}
+}
+
+func TestResolveVideoReferencesReturnsMissingAssetError(t *testing.T) {
+	service := &Service{mediaAssets: newVideoAssetStoreStub()}
+	if _, err := service.resolveVideoReferences(context.Background(), videoInputMetadata{References: []videoInputReference{{AssetID: "img_missing"}}}); err == nil {
+		t.Fatal("missing input asset was accepted")
+	}
+}
+
+func TestVideoJobResponseMetadataDoesNotInferProtocolFromID(t *testing.T) {
+	nativeJob := media.Job{ID: "video_oai_collision", InputJSON: encodeVideoInput([]string{"https://example.com/reference.png"}, false, "")}
+	if compatible, _ := VideoJobResponseMetadata(nativeJob); compatible {
+		t.Fatal("native job was classified by ID prefix")
+	}
+	if references := decodeVideoInput(nativeJob.InputJSON).References; len(references) != 1 || references[0].URL != "https://example.com/reference.png" {
+		t.Fatalf("reference images=%#v", references)
+	}
+	compatibleJob := media.Job{ID: "video_random", InputJSON: encodeVideoInput(nil, true, "1280x720")}
+	compatible, size := VideoJobResponseMetadata(compatibleJob)
+	if !compatible || size != "1280x720" {
+		t.Fatalf("compatible=%t size=%q", compatible, size)
+	}
+	legacyCompatible := media.Job{ID: "video_oai_legacy", InputJSON: `{"image_urls":[]}`}
+	if compatible, _ := VideoJobResponseMetadata(legacyCompatible); !compatible {
+		t.Fatal("legacy compatible job was not recognized")
+	}
+}
+
+func TestVideoOAuthUnauthorizedMarksAccountFailure(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-oauth-401.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	credential, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "video-oauth-401",
+		SourceKey: "video-oauth-401", EncryptedAccessToken: "encrypted", AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{selector: NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)}
+	startedAt := time.Now().UTC()
+	service.handleVideoCredentialRejected(ctx, credential)
+	stored, err := accounts.Get(ctx, credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.FailureCount != 1 || stored.CooldownUntil == nil || !stored.CooldownUntil.After(startedAt) || !strings.Contains(stored.LastError, "401") {
+		t.Fatalf("stored credential after video 401 = %#v", stored)
+	}
+}
 
 func TestRecoverVideoJobsRetriesUsageWithoutRegeneratingVideo(t *testing.T) {
 	completedAt := time.Now().UTC()
@@ -146,7 +281,13 @@ func (a *videoPersistAdapter) DownloadVideo(_ context.Context, credential accoun
 	return io.NopCloser(strings.NewReader("video")), "video/mp4", 5, nil
 }
 
-type videoAssetStoreStub struct{ saveCalls int }
+type videoAssetStoreStub struct {
+	saveCalls   int
+	images      map[string]storedVideoInputImage
+	deleted     []string
+	saves       int
+	saveErrorAt int
+}
 
 func (s *videoAssetStoreStub) SaveVideo(_ context.Context, jobID, contentType string, body io.Reader) (media.Asset, error) {
 	s.saveCalls++
@@ -186,6 +327,44 @@ func (r *durableVideoAuditRecorder) CreateDurable(_ context.Context, value audit
 
 type videoUsageRepository struct{ job media.Job }
 
+type storedVideoInputImage struct {
+	asset media.Asset
+	data  []byte
+}
+
+func newVideoAssetStoreStub() *videoAssetStoreStub {
+	return &videoAssetStoreStub{images: make(map[string]storedVideoInputImage)}
+}
+
+func (s *videoAssetStoreStub) SaveVideoInputImage(_ context.Context, data []byte) (media.Asset, error) {
+	s.saves++
+	if s.saveErrorAt == s.saves {
+		return media.Asset{}, errors.New("save failed")
+	}
+	id := fmt.Sprintf("img_input_%d", s.saves)
+	mimeType := "image/png"
+	asset := media.Asset{ID: id, Kind: "image", MIMEType: mimeType, SizeBytes: int64(len(data))}
+	s.images[id] = storedVideoInputImage{asset: asset, data: append([]byte(nil), data...)}
+	return asset, nil
+}
+
+func (s *videoAssetStoreStub) DeleteVideoInputImage(_ context.Context, id string) error {
+	if _, ok := s.images[id]; !ok {
+		return errors.New("not found")
+	}
+	delete(s.images, id)
+	s.deleted = append(s.deleted, id)
+	return nil
+}
+
+func (s *videoAssetStoreStub) OpenInternalImage(_ context.Context, id string) (media.Asset, io.ReadCloser, error) {
+	stored, ok := s.images[id]
+	if !ok {
+		return media.Asset{}, nil, errors.New("not found")
+	}
+	return stored.asset, io.NopCloser(bytes.NewReader(stored.data)), nil
+}
+
 func (r *videoUsageRepository) CreateMediaJob(context.Context, media.Job) error { return nil }
 
 func (r *videoUsageRepository) GetMediaJob(context.Context, string, uint64) (media.Job, error) {
@@ -222,7 +401,6 @@ func (r *videoUsageRepository) ListUnrecordedTerminalMediaJobs(context.Context, 
 func (r *videoUsageRepository) TryClaimMediaJob(context.Context, string, time.Time, time.Time, string) (media.Job, bool, error) {
 	return media.Job{}, false, nil
 }
-
 func (r *videoUsageRepository) MarkMediaJobUsageRecorded(_ context.Context, _ string, recordedAt time.Time) error {
 	r.job.UsageRecordedAt = &recordedAt
 	return nil

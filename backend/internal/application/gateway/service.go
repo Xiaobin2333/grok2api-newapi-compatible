@@ -37,6 +37,7 @@ var (
 	ErrResponseAccountUnavailable = errors.New("Response 绑定的上游账号不可用")
 	ErrResponseStateUnsupported   = errors.New("目标模型不支持有状态 Response")
 	ErrConversationUnsupported    = errors.New("目标模型不支持当前对话协议")
+	ErrVideoInputTooLarge         = errors.New("视频输入超过持久化上限")
 )
 
 const responseOwnershipTTL = 30 * 24 * time.Hour
@@ -92,9 +93,12 @@ type routeResolver interface {
 	GetByProviderUpstream(ctx context.Context, providerValue accountdomain.Provider, upstreamModel string) (modeldomain.Route, error)
 }
 
-// videoAssetStore 负责归档并读取 Provider 已生成的视频结果。
+// videoAssetStore 负责暂存视频输入图片，并归档、读取已生成的视频结果。
 type videoAssetStore interface {
 	SaveVideo(ctx context.Context, jobID, contentType string, body io.Reader) (mediadomain.Asset, error)
+	SaveVideoInputImage(ctx context.Context, data []byte) (mediadomain.Asset, error)
+	DeleteVideoInputImage(ctx context.Context, id string) error
+	OpenInternalImage(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
 	OpenVideo(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error)
 }
 
@@ -142,7 +146,7 @@ func (s *Service) ConfigureMedia(repository repository.MediaJobRepository, concu
 	s.mediaQueued = make(map[string]struct{})
 }
 
-// ConfigureMediaAssets 注入本地视频资产归档与读取能力（可选）。
+// ConfigureMediaAssets 注入本地视频输入暂存、结果归档与读取能力（可选）。
 func (s *Service) ConfigureMediaAssets(store videoAssetStore) {
 	s.mediaAssets = store
 }
