@@ -52,6 +52,7 @@ type MediaJobStats struct {
 }
 
 type MediaJobRepository interface {
+	// CreateMediaJob 原子保存任务及其有序输入资产关联。
 	CreateMediaJob(ctx context.Context, value media.Job) error
 	GetMediaJob(ctx context.Context, id string, clientKeyID uint64) (media.Job, error)
 	GetMediaJobsByIDs(ctx context.Context, ids []string) ([]media.Job, error)
@@ -75,6 +76,8 @@ type MediaAssetRepository interface {
 	// ListOldestMediaAssets 按 created_at ASC, id ASC 分页；offset 用于跳过已扫描的受保护资产。
 	ListOldestMediaAssets(ctx context.Context, offset, limit int) ([]media.Asset, error)
 	DeleteMediaAsset(ctx context.Context, id string) error
+	// DeleteUnreferencedVideoInputAsset 仅删除未被任何视频任务引用的内部输入图片元数据。
+	DeleteUnreferencedVideoInputAsset(ctx context.Context, id string) (bool, error)
 	// ListActiveVideoAssetIDs 返回进行中任务或未消费票据绑定的资产 ID，清理时必须跳过。
 	ListProtectedMediaAssetIDs(ctx context.Context) (map[string]struct{}, error)
 }

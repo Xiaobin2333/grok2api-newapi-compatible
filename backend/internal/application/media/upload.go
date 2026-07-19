@@ -299,7 +299,7 @@ func (s *Service) commitStagedVideo(ctx context.Context, staged stagedVideo, cre
 		return mediadomain.Asset{}, err
 	}
 	asset := mediadomain.Asset{
-		ID: staged.ID, Kind: "video", StorageKey: staged.StorageKey, MIMEType: staged.MIMEType,
+		ID: staged.ID, Kind: "video", Purpose: mediadomain.AssetPurposeOutput, StorageKey: staged.StorageKey, MIMEType: staged.MIMEType,
 		SizeBytes: staged.SizeBytes, SHA256: staged.SHA256, CreatedAt: createdAt,
 	}
 	if err := s.assets.CreateMediaAsset(ctx, asset); err != nil {

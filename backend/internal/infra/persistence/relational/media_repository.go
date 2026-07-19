@@ -22,8 +22,8 @@ func NewMediaAssetRepository(db *Database) *MediaAssetRepository {
 
 func (r *MediaAssetRepository) CreateMediaAsset(ctx context.Context, value media.Asset) error {
 	row := mediaAssetModel{
-		ID: value.ID, Kind: value.Kind, StorageKey: value.StorageKey, MIMEType: value.MIMEType,
-		SizeBytes: value.SizeBytes, SHA256: value.SHA256, CreatedAt: value.CreatedAt,
+		ID: value.ID, Kind: value.Kind, Purpose: normalizeMediaAssetPurpose(value.Purpose), StorageKey: value.StorageKey, MIMEType: value.MIMEType,
+		SizeBytes: value.SizeBytes, SHA256: value.SHA256, CreatedAt: value.CreatedAt, StagedUntil: value.StagedUntil,
 	}
 	return r.db.db.WithContext(ctx).Create(&row).Error
 }
@@ -34,15 +34,15 @@ func (r *MediaAssetRepository) GetMediaAsset(ctx context.Context, id string) (me
 		return media.Asset{}, mapError(err)
 	}
 	return media.Asset{
-		ID: row.ID, Kind: row.Kind, StorageKey: row.StorageKey, MIMEType: row.MIMEType,
-		SizeBytes: row.SizeBytes, SHA256: row.SHA256, CreatedAt: row.CreatedAt,
+		ID: row.ID, Kind: row.Kind, Purpose: row.Purpose, StorageKey: row.StorageKey, MIMEType: row.MIMEType,
+		SizeBytes: row.SizeBytes, SHA256: row.SHA256, CreatedAt: row.CreatedAt, StagedUntil: row.StagedUntil,
 	}, nil
 }
 
 // ListMediaAssets 通过字段投影返回符合筛选条件的稳定分页结果。
 // 默认仅列出图片，避免管理端图库混入视频资产。
 func (r *MediaAssetRepository) ListMediaAssets(ctx context.Context, input repository.MediaAssetListQuery) ([]media.Asset, int64, error) {
-	query := r.db.db.WithContext(ctx).Model(&mediaAssetModel{}).Where("kind = ?", "image")
+	query := r.db.db.WithContext(ctx).Model(&mediaAssetModel{}).Where("kind = ? AND purpose = ?", "image", media.AssetPurposeOutput)
 	if search := strings.TrimSpace(input.Page.Search); search != "" {
 		pattern := "%" + strings.ToLower(search) + "%"
 		query = query.Where("LOWER(id) LIKE ? OR LOWER(kind) LIKE ? OR LOWER(mime_type) LIKE ? OR LOWER(sha256) LIKE ?", pattern, pattern, pattern, pattern)
@@ -52,14 +52,14 @@ func (r *MediaAssetRepository) ListMediaAssets(ctx context.Context, input reposi
 		return nil, 0, err
 	}
 	var rows []mediaAssetModel
-	if err := query.Select("id", "kind", "mime_type", "size_bytes", "sha256", "created_at").Order("created_at DESC, id DESC").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+	if err := query.Select("id", "kind", "purpose", "mime_type", "size_bytes", "sha256", "created_at", "staged_until").Order("created_at DESC, id DESC").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	values := make([]media.Asset, 0, len(rows))
 	for _, row := range rows {
 		values = append(values, media.Asset{
-			ID: row.ID, Kind: row.Kind, StorageKey: row.StorageKey, MIMEType: row.MIMEType,
-			SizeBytes: row.SizeBytes, SHA256: row.SHA256, CreatedAt: row.CreatedAt,
+			ID: row.ID, Kind: row.Kind, Purpose: row.Purpose, StorageKey: row.StorageKey, MIMEType: row.MIMEType,
+			SizeBytes: row.SizeBytes, SHA256: row.SHA256, CreatedAt: row.CreatedAt, StagedUntil: row.StagedUntil,
 		})
 	}
 	return values, total, nil
@@ -69,7 +69,7 @@ func (r *MediaAssetRepository) ListMediaAssets(ctx context.Context, input reposi
 func (r *MediaAssetRepository) SummarizeMediaAssets(ctx context.Context) (repository.MediaAssetStats, error) {
 	var stats repository.MediaAssetStats
 	err := r.db.db.WithContext(ctx).Model(&mediaAssetModel{}).
-		Select("COALESCE(SUM(CASE WHEN kind = 'image' THEN 1 ELSE 0 END), 0) AS total_images, COALESCE(SUM(size_bytes), 0) AS total_bytes").
+		Select("COALESCE(SUM(CASE WHEN kind = 'image' AND purpose = ? THEN 1 ELSE 0 END), 0) AS total_images, COALESCE(SUM(size_bytes), 0) AS total_bytes", media.AssetPurposeOutput).
 		Scan(&stats).Error
 	return stats, err
 }
@@ -94,27 +94,83 @@ func (r *MediaAssetRepository) ListOldestMediaAssets(ctx context.Context, offset
 	values := make([]media.Asset, 0, len(rows))
 	for _, row := range rows {
 		values = append(values, media.Asset{
-			ID: row.ID, Kind: row.Kind, StorageKey: row.StorageKey, MIMEType: row.MIMEType,
-			SizeBytes: row.SizeBytes, SHA256: row.SHA256, CreatedAt: row.CreatedAt,
+			ID: row.ID, Kind: row.Kind, Purpose: row.Purpose, StorageKey: row.StorageKey, MIMEType: row.MIMEType,
+			SizeBytes: row.SizeBytes, SHA256: row.SHA256, CreatedAt: row.CreatedAt, StagedUntil: row.StagedUntil,
 		})
 	}
 	return values, nil
 }
 
 func (r *MediaAssetRepository) DeleteMediaAsset(ctx context.Context, id string) error {
-	result := r.db.db.WithContext(ctx).Where("id = ?", id).Delete(&mediaAssetModel{})
+	activeStatuses := []string{string(media.StatusQueued), string(media.StatusInProgress)}
+	activeInputReference := r.db.db.Table("media_job_input_assets AS input_assets").
+		Select("1").
+		Joins("JOIN media_jobs AS jobs ON jobs.id = input_assets.job_id").
+		Where("input_assets.asset_id = media_assets.id AND jobs.status IN ?", activeStatuses)
+	activeResultReference := r.db.db.Table("media_jobs AS result_jobs").
+		Select("1").
+		Where("result_jobs.result_asset_id = media_assets.id AND result_jobs.status IN ?", activeStatuses)
+	activeUploadTicket := r.db.db.Table("media_upload_tickets AS upload_tickets").
+		Select("1").
+		Where("upload_tickets.asset_id = media_assets.id AND upload_tickets.consumed_at IS NULL AND upload_tickets.expires_at > ?", time.Now().UTC())
+	result := r.db.db.WithContext(ctx).
+		Where("id = ? AND NOT EXISTS (?) AND NOT EXISTS (?) AND NOT EXISTS (?)", id,
+			activeInputReference, activeResultReference, activeUploadTicket).
+		Delete(&mediaAssetModel{})
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
+		var count int64
+		if err := r.db.db.WithContext(ctx).Model(&mediaAssetModel{}).Where("id = ?", id).Count(&count).Error; err != nil {
+			return err
+		}
+		if count > 0 {
+			return repository.ErrConflict
+		}
 		return repository.ErrNotFound
 	}
 	return nil
 }
 
-// ListProtectedMediaAssetIDs 返回不可清理的资产：进行中视频任务结果、未消费且未过期的上传票据。
+func (r *MediaAssetRepository) DeleteUnreferencedVideoInputAsset(ctx context.Context, id string) (bool, error) {
+	result := r.db.db.WithContext(ctx).
+		Where("id = ? AND kind = ? AND purpose = ? AND NOT EXISTS (?)", strings.TrimSpace(id), "image", media.AssetPurposeVideoInput,
+			r.db.db.Model(&mediaJobInputAssetModel{}).Select("1").Where("media_job_input_assets.asset_id = media_assets.id")).
+		Delete(&mediaAssetModel{})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
+// ListProtectedMediaAssetIDs 返回不可清理的资产：暂存图片、活跃任务输入/结果、未消费且未过期的上传票据。
 func (r *MediaAssetRepository) ListProtectedMediaAssetIDs(ctx context.Context) (map[string]struct{}, error) {
 	protected := make(map[string]struct{})
+	now := time.Now().UTC()
+	var stagedAssetIDs []string
+	if err := r.db.db.WithContext(ctx).Model(&mediaAssetModel{}).
+		Where("staged_until IS NOT NULL AND staged_until > ?", now).
+		Pluck("id", &stagedAssetIDs).Error; err != nil {
+		return nil, err
+	}
+	for _, id := range stagedAssetIDs {
+		if id != "" {
+			protected[id] = struct{}{}
+		}
+	}
+	var inputAssetIDs []string
+	if err := r.db.db.WithContext(ctx).Table("media_job_input_assets AS input_assets").
+		Joins("JOIN media_jobs AS jobs ON jobs.id = input_assets.job_id").
+		Where("jobs.status IN ?", []string{string(media.StatusQueued), string(media.StatusInProgress)}).
+		Distinct().Pluck("input_assets.asset_id", &inputAssetIDs).Error; err != nil {
+		return nil, err
+	}
+	for _, id := range inputAssetIDs {
+		if id != "" {
+			protected[id] = struct{}{}
+		}
+	}
 	var jobAssetIDs []string
 	if err := r.db.db.WithContext(ctx).Model(&mediaJobModel{}).
 		Where("result_asset_id <> '' AND status IN ?", []string{string(media.StatusQueued), string(media.StatusInProgress)}).
@@ -127,7 +183,6 @@ func (r *MediaAssetRepository) ListProtectedMediaAssetIDs(ctx context.Context) (
 		}
 	}
 	var ticketAssetIDs []string
-	now := time.Now().UTC()
 	if err := r.db.db.WithContext(ctx).Model(&mediaUploadTicketModel{}).
 		Where("consumed_at IS NULL AND expires_at > ?", now).
 		Pluck("asset_id", &ticketAssetIDs).Error; err != nil {
@@ -261,7 +316,36 @@ func ticketToDomain(row mediaUploadTicketModel) repository.MediaUploadTicket {
 }
 
 func (r *MediaJobRepository) CreateMediaJob(ctx context.Context, value media.Job) error {
-	return r.db.db.WithContext(ctx).Create(mediaJobFromDomain(value)).Error
+	return r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(mediaJobFromDomain(value)).Error; err != nil {
+			return err
+		}
+		if len(value.InputAssetIDs) == 0 {
+			return nil
+		}
+		links := make([]mediaJobInputAssetModel, 0, len(value.InputAssetIDs))
+		assetIDs := make([]string, 0, len(value.InputAssetIDs))
+		uniqueAssetIDs := make(map[string]struct{}, len(value.InputAssetIDs))
+		for position, assetID := range value.InputAssetIDs {
+			assetID = strings.TrimSpace(assetID)
+			links = append(links, mediaJobInputAssetModel{JobID: value.ID, AssetID: assetID, Position: position})
+			if _, exists := uniqueAssetIDs[assetID]; !exists {
+				uniqueAssetIDs[assetID] = struct{}{}
+				assetIDs = append(assetIDs, assetID)
+			}
+		}
+		var validAssets int64
+		if err := tx.Model(&mediaAssetModel{}).Where("id IN ? AND kind = ? AND purpose = ?", assetIDs, "image", media.AssetPurposeVideoInput).Count(&validAssets).Error; err != nil {
+			return err
+		}
+		if validAssets != int64(len(assetIDs)) {
+			return repository.ErrNotFound
+		}
+		if err := tx.Create(&links).Error; err != nil {
+			return err
+		}
+		return tx.Model(&mediaAssetModel{}).Where("id IN ?", assetIDs).Update("staged_until", nil).Error
+	})
 }
 
 func (r *MediaJobRepository) GetMediaJob(ctx context.Context, id string, clientKeyID uint64) (media.Job, error) {
@@ -269,7 +353,11 @@ func (r *MediaJobRepository) GetMediaJob(ctx context.Context, id string, clientK
 	if err := r.db.db.WithContext(ctx).Where("id = ? AND client_key_id = ?", id, clientKeyID).First(&row).Error; err != nil {
 		return media.Job{}, mapError(err)
 	}
-	return mediaJobToDomain(row), nil
+	values := []media.Job{mediaJobToDomain(row)}
+	if err := r.loadInputAssetIDs(ctx, values); err != nil {
+		return media.Job{}, err
+	}
+	return values[0], nil
 }
 
 // GetMediaJobsByIDs 返回管理端明确选择的完整视频任务。
@@ -285,7 +373,17 @@ func (r *MediaJobRepository) GetMediaJobsByIDs(ctx context.Context, ids []string
 	for _, row := range rows {
 		values = append(values, mediaJobToDomain(row))
 	}
+	if err := r.loadInputAssetIDs(ctx, values); err != nil {
+		return nil, err
+	}
 	return values, nil
+}
+
+func normalizeMediaAssetPurpose(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return media.AssetPurposeOutput
+	}
+	return strings.TrimSpace(value)
 }
 
 func (r *MediaJobRepository) UpdateMediaJob(ctx context.Context, value media.Job) error {
@@ -383,6 +481,9 @@ func (r *MediaJobRepository) ListUnrecordedTerminalMediaJobs(ctx context.Context
 	for _, row := range rows {
 		values = append(values, mediaJobToDomain(row))
 	}
+	if err := r.loadInputAssetIDs(ctx, values); err != nil {
+		return nil, err
+	}
 	return values, nil
 }
 
@@ -414,6 +515,9 @@ func (r *MediaJobRepository) ListRecoverableMediaJobs(ctx context.Context, limit
 	for _, row := range rows {
 		values = append(values, mediaJobToDomain(row))
 	}
+	if err := r.loadInputAssetIDs(ctx, values); err != nil {
+		return nil, err
+	}
 	return values, nil
 }
 
@@ -435,7 +539,34 @@ func (r *MediaJobRepository) TryClaimMediaJob(ctx context.Context, id string, no
 	if err := r.db.db.WithContext(ctx).Where("id = ?", id).First(&row).Error; err != nil {
 		return media.Job{}, false, mapError(err)
 	}
-	return mediaJobToDomain(row), true, nil
+	values := []media.Job{mediaJobToDomain(row)}
+	if err := r.loadInputAssetIDs(ctx, values); err != nil {
+		return media.Job{}, false, err
+	}
+	return values[0], true, nil
+}
+
+func (r *MediaJobRepository) loadInputAssetIDs(ctx context.Context, jobs []media.Job) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	jobIDs := make([]string, 0, len(jobs))
+	indexes := make(map[string]int, len(jobs))
+	for index := range jobs {
+		jobIDs = append(jobIDs, jobs[index].ID)
+		indexes[jobs[index].ID] = index
+		jobs[index].InputAssetIDs = nil
+	}
+	var rows []mediaJobInputAssetModel
+	if err := r.db.db.WithContext(ctx).Where("job_id IN ?", jobIDs).Order("job_id ASC, position ASC").Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if index, ok := indexes[row.JobID]; ok {
+			jobs[index].InputAssetIDs = append(jobs[index].InputAssetIDs, row.AssetID)
+		}
+	}
+	return nil
 }
 
 func mediaJobFromDomain(value media.Job) *mediaJobModel {

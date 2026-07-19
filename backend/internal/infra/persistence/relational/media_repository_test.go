@@ -176,6 +176,166 @@ func TestAccountDeleteDetachesTerminalMediaJobsAndRejectsActiveJobs(t *testing.T
 	}
 }
 
+func TestMediaJobRepositoryPersistsOrderedInputAssetsAndProtectsActiveJobs(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider:             accountdomain.ProviderWeb,
+		AuthType:             accountdomain.AuthTypeSSO,
+		WebTier:              accountdomain.WebTierBasic,
+		Name:                 "media-input-account",
+		SourceKey:            "media-input-account",
+		EncryptedAccessToken: testEncryptedToken,
+		AuthStatus:           accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "media-input-key", Prefix: "media-input-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	stagedUntil := now.Add(time.Hour)
+	first := testMediaAsset("img_input_first_aaaaaaaa", "media/input-first.png", now)
+	second := testMediaAsset("img_input_second_aaaaaaa", "media/input-second.png", now.Add(time.Second))
+	first.Purpose, second.Purpose = mediadomain.AssetPurposeVideoInput, mediadomain.AssetPurposeVideoInput
+	first.StagedUntil, second.StagedUntil = &stagedUntil, &stagedUntil
+	assets := NewMediaAssetRepository(database)
+	for _, asset := range []mediadomain.Asset{first, second} {
+		if err := assets.CreateMediaAsset(ctx, asset); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	jobs := NewMediaJobRepository(database)
+	job := testMediaJob("media_job_ordered_inputs", accountValue.ID, key.ID, mediadomain.StatusQueued, now)
+	job.InputAssetIDs = []string{second.ID, first.ID}
+	if err := jobs.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	for _, assetID := range job.InputAssetIDs {
+		stored, err := assets.GetMediaAsset(ctx, assetID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.StagedUntil != nil {
+			t.Fatalf("asset %s remained staged until %v", assetID, stored.StagedUntil)
+		}
+	}
+
+	stored, err := jobs.GetMediaJob(ctx, job.ID, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStringsEqual(t, stored.InputAssetIDs, second.ID, first.ID)
+	selected, err := jobs.GetMediaJobsByIDs(ctx, []string{job.ID})
+	if err != nil || len(selected) != 1 {
+		t.Fatalf("selected=%#v err=%v", selected, err)
+	}
+	assertStringsEqual(t, selected[0].InputAssetIDs, second.ID, first.ID)
+
+	protected, err := assets.ListProtectedMediaAssetIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProtectedAssetIDs(t, protected, job.InputAssetIDs...)
+
+	claimed, ok, err := jobs.TryClaimMediaJob(ctx, job.ID, now, now.Add(time.Hour), "claim_input_assets_00000001")
+	if err != nil || !ok {
+		t.Fatalf("claim = %#v, ok = %v, err = %v", claimed, ok, err)
+	}
+	assertStringsEqual(t, claimed.InputAssetIDs, second.ID, first.ID)
+	if err := assets.DeleteMediaAsset(ctx, second.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("active input delete error = %v, want conflict", err)
+	}
+	deletedInput, err := assets.DeleteUnreferencedVideoInputAsset(ctx, second.ID)
+	if err != nil || deletedInput {
+		t.Fatalf("referenced input delete = (%v, %v), want false, nil", deletedInput, err)
+	}
+	protected, err = assets.ListProtectedMediaAssetIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertProtectedAssetIDs(t, protected, job.InputAssetIDs...)
+
+	completedAt := now.Add(time.Minute)
+	claimed.Status, claimed.Progress = mediadomain.StatusCompleted, 100
+	claimed.LeaseUntil, claimed.CompletedAt, claimed.UpdatedAt = nil, &completedAt, completedAt
+	if err := jobs.UpdateMediaJob(ctx, claimed); err != nil {
+		t.Fatal(err)
+	}
+	protected, err = assets.ListProtectedMediaAssetIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, assetID := range job.InputAssetIDs {
+		if _, ok := protected[assetID]; ok {
+			t.Fatalf("terminal job input asset %s remained cleanup-protected", assetID)
+		}
+	}
+
+	if err := assets.DeleteMediaAsset(ctx, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = jobs.GetMediaJob(ctx, job.ID, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStringsEqual(t, stored.InputAssetIDs, first.ID)
+}
+
+func TestMediaJobRepositoryRollsBackJobAndKeepsStagingWhenInputLinkFails(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+
+	accountValue, _, err := NewAccountRepository(database).UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider:             accountdomain.ProviderWeb,
+		AuthType:             accountdomain.AuthTypeSSO,
+		WebTier:              accountdomain.WebTierBasic,
+		Name:                 "media-rollback-account",
+		SourceKey:            "media-rollback-account",
+		EncryptedAccessToken: testEncryptedToken,
+		AuthStatus:           accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := clientKeyModel{Name: "media-rollback-key", Prefix: "media-rollback-key", SecretHash: testSecretHash, EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4}
+	if err := database.db.WithContext(ctx).Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	stagedUntil := now.Add(time.Hour)
+	asset := testMediaAsset("img_input_rollback_aaaaa", "media/input-rollback.png", now)
+	asset.Purpose = mediadomain.AssetPurposeVideoInput
+	asset.StagedUntil = &stagedUntil
+	assets := NewMediaAssetRepository(database)
+	if err := assets.CreateMediaAsset(ctx, asset); err != nil {
+		t.Fatal(err)
+	}
+
+	job := testMediaJob("media_job_input_rollback", accountValue.ID, key.ID, mediadomain.StatusQueued, now)
+	job.InputAssetIDs = []string{asset.ID, "img_missing_input_aaaaaa"}
+	jobs := NewMediaJobRepository(database)
+	if err := jobs.CreateMediaJob(ctx, job); err == nil {
+		t.Fatal("job with missing input asset was accepted")
+	}
+	if _, err := jobs.GetMediaJob(ctx, job.ID, key.ID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("rolled-back job read error = %v", err)
+	}
+	stored, err := assets.GetMediaAsset(ctx, asset.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.StagedUntil == nil || !stored.StagedUntil.Equal(stagedUntil) {
+		t.Fatalf("staging changed after rollback: %v", stored.StagedUntil)
+	}
+}
+
 func TestMediaAssetRepositoryListMediaAssetsPaginatesAndCounts(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)
@@ -195,6 +355,9 @@ func TestMediaAssetRepositoryListMediaAssetsPaginatesAndCounts(t *testing.T) {
 		testMediaAsset("media_asset_0002", "media/asset-0002.png", now.Add(-2*time.Hour)),
 		testMediaAsset("media_asset_0003", "media/asset-0003.png", now.Add(-time.Hour)),
 	}
+	internalInput := testMediaAsset("media_input_hidden_0001", "media/input-hidden.png", now)
+	internalInput.Purpose = mediadomain.AssetPurposeVideoInput
+	assets = append(assets, internalInput)
 	for _, asset := range assets {
 		if err := assetRepo.CreateMediaAsset(ctx, asset); err != nil {
 			t.Fatal(err)
@@ -238,7 +401,7 @@ func TestMediaAssetRepositoryListMediaAssetsPaginatesAndCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.TotalImages != 3 || stats.TotalBytes != 3*1024 {
+	if stats.TotalImages != 3 || stats.TotalBytes != 4*1024 {
 		t.Fatalf("stats = %#v", stats)
 	}
 }
@@ -387,6 +550,27 @@ func assertMediaAssetIDs(t *testing.T, values []mediadomain.Asset, expected ...s
 	for index, id := range expected {
 		if values[index].ID != id {
 			t.Fatalf("values[%d].ID = %q, expected %q; values = %#v", index, values[index].ID, id, values)
+		}
+	}
+}
+
+func assertStringsEqual(t *testing.T, values []string, expected ...string) {
+	t.Helper()
+	if len(values) != len(expected) {
+		t.Fatalf("values = %#v, expected %#v", values, expected)
+	}
+	for index := range expected {
+		if values[index] != expected[index] {
+			t.Fatalf("values = %#v, expected %#v", values, expected)
+		}
+	}
+}
+
+func assertProtectedAssetIDs(t *testing.T, protected map[string]struct{}, expected ...string) {
+	t.Helper()
+	for _, assetID := range expected {
+		if _, ok := protected[assetID]; !ok {
+			t.Fatalf("asset %s was not protected: %#v", assetID, protected)
 		}
 	}
 }

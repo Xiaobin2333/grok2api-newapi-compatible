@@ -401,23 +401,38 @@ type mediaJobModel struct {
 	UpdatedAt       time.Time `gorm:"not null"`
 	CompletedAt     *time.Time
 	UsageRecordedAt *time.Time
-	Account         *accountModel   `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
-	ClientKey       *clientKeyModel `gorm:"foreignKey:ClientKeyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	Account         *accountModel             `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
+	ClientKey       *clientKeyModel           `gorm:"foreignKey:ClientKeyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+	InputAssets     []mediaJobInputAssetModel `gorm:"foreignKey:JobID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }
 
 func (mediaJobModel) TableName() string { return "media_jobs" }
+
+// mediaJobInputAssetModel 将异步视频任务与已落盘的输入图片按请求顺序关联。
+// 关联本身随任一端删除，资产清理由活跃任务保护查询约束。
+type mediaJobInputAssetModel struct {
+	JobID    string           `gorm:"size:64;primaryKey;check:chk_media_job_input_assets_job_id,length(trim(job_id)) BETWEEN 1 AND 64"`
+	Position int              `gorm:"primaryKey;check:chk_media_job_input_assets_position,position BETWEEN 0 AND 7"`
+	AssetID  string           `gorm:"size:64;not null;check:chk_media_job_input_assets_asset_id,length(trim(asset_id)) BETWEEN 16 AND 64"`
+	Job      *mediaJobModel   `gorm:"foreignKey:JobID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+	Asset    *mediaAssetModel `gorm:"foreignKey:AssetID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+func (mediaJobInputAssetModel) TableName() string { return "media_job_input_assets" }
 
 // MaxVideoAssetBytes 是本地视频对象与上传接收的安全体积上限（256 MiB）。
 const MaxVideoAssetBytes = 256 << 20
 
 type mediaAssetModel struct {
-	ID         string    `gorm:"size:64;primaryKey;check:chk_media_assets_id,length(trim(id)) BETWEEN 16 AND 64"`
-	Kind       string    `gorm:"size:16;not null;check:chk_media_assets_kind,kind IN ('image','video')"`
-	StorageKey string    `gorm:"size:512;not null;uniqueIndex;check:chk_media_assets_storage_key,length(trim(storage_key)) BETWEEN 1 AND 512"`
-	MIMEType   string    `gorm:"size:64;not null;check:chk_media_assets_mime,mime_type IN ('image/jpeg','image/png','image/webp','image/gif','video/mp4','video/webm','video/quicktime')"`
-	SizeBytes  int64     `gorm:"not null;check:chk_media_assets_size,size_bytes > 0 AND size_bytes <= 268435456"`
-	SHA256     string    `gorm:"size:64;not null;check:chk_media_assets_sha,length(sha256) = 64"`
-	CreatedAt  time.Time `gorm:"not null"`
+	ID          string    `gorm:"size:64;primaryKey;check:chk_media_assets_id,length(trim(id)) BETWEEN 16 AND 64"`
+	Kind        string    `gorm:"size:16;not null;check:chk_media_assets_kind,kind IN ('image','video')"`
+	Purpose     string    `gorm:"size:32;not null;default:'output';check:chk_media_assets_purpose,purpose IN ('output','video_input')"`
+	StorageKey  string    `gorm:"size:512;not null;uniqueIndex;check:chk_media_assets_storage_key,length(trim(storage_key)) BETWEEN 1 AND 512"`
+	MIMEType    string    `gorm:"size:64;not null;check:chk_media_assets_mime,mime_type IN ('image/jpeg','image/png','image/webp','image/gif','video/mp4','video/webm','video/quicktime')"`
+	SizeBytes   int64     `gorm:"not null;check:chk_media_assets_size,size_bytes > 0 AND size_bytes <= 268435456"`
+	SHA256      string    `gorm:"size:64;not null;check:chk_media_assets_sha,length(sha256) = 64"`
+	CreatedAt   time.Time `gorm:"not null"`
+	StagedUntil *time.Time
 }
 
 func (mediaAssetModel) TableName() string { return "media_assets" }

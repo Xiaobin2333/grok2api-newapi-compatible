@@ -23,12 +23,16 @@ import (
 var (
 	ErrAssetNotFound         = errors.New("媒体资源不存在")
 	ErrInvalidImage          = errors.New("图片内容无效")
+	ErrImageTooLarge         = errors.New("图片超过体积上限")
 	ErrInvalidImageSelection = errors.New("图片选择无效")
+	ErrActiveImageSelection  = fmt.Errorf("%w: 视频任务正在使用的图片不能删除", ErrInvalidImageSelection)
 	ErrInvalidVideoSelection = errors.New("视频任务选择无效")
 	ErrActiveVideoSelection  = errors.New("排队中或生成中的视频任务不能删除")
 	ErrInvalidFilter         = errors.New("媒体筛选条件无效")
 	ErrMediaJobsUnavailable  = errors.New("视频任务仓储未配置")
 )
+
+const videoInputImageStagingTTL = 10 * time.Minute
 
 // Service 负责图片/视频校验、文件落盘和元数据持久化的一致性收口。
 type Service struct {
@@ -100,9 +104,22 @@ func (s *Service) UpdateConfig(cfg Config) {
 
 // SaveImage 校验并保存一份不可变图片，文件写入失败或元数据落库失败时不会留下半成品。
 func (s *Service) SaveImage(ctx context.Context, data []byte) (mediadomain.Asset, error) {
+	return s.saveImage(ctx, data, mediadomain.AssetPurposeOutput, nil)
+}
+
+// SaveVideoInputImage 保存视频任务的暂存输入图片，给任务落库和入队预留保护窗口。
+func (s *Service) SaveVideoInputImage(ctx context.Context, data []byte) (mediadomain.Asset, error) {
+	stagedUntil := time.Now().UTC().Add(videoInputImageStagingTTL)
+	return s.saveImage(ctx, data, mediadomain.AssetPurposeVideoInput, &stagedUntil)
+}
+
+func (s *Service) saveImage(ctx context.Context, data []byte, purpose string, stagedUntil *time.Time) (mediadomain.Asset, error) {
 	cfg := s.runtimeConfig()
-	if len(data) == 0 || int64(len(data)) > cfg.MaxImageBytes {
+	if len(data) == 0 {
 		return mediadomain.Asset{}, ErrInvalidImage
+	}
+	if int64(len(data)) > cfg.MaxImageBytes {
+		return mediadomain.Asset{}, fmt.Errorf("%w: %w", ErrInvalidImage, ErrImageTooLarge)
 	}
 	mimeType := http.DetectContentType(data)
 	if !supportedImageMIME(mimeType) {
@@ -119,8 +136,9 @@ func (s *Service) SaveImage(ctx context.Context, data []byte) (mediadomain.Asset
 		return mediadomain.Asset{}, err
 	}
 	asset := mediadomain.Asset{
-		ID: id, Kind: "image", StorageKey: storageKey, MIMEType: mimeType,
+		ID: id, Kind: "image", Purpose: purpose, StorageKey: storageKey, MIMEType: mimeType,
 		SizeBytes: int64(len(data)), SHA256: hex.EncodeToString(digest[:]), CreatedAt: createdAt,
+		StagedUntil: stagedUntil,
 	}
 	if err := s.assets.CreateMediaAsset(ctx, asset); err != nil {
 		_ = s.objects.Delete(context.WithoutCancel(ctx), storageKey)
@@ -135,6 +153,39 @@ func (s *Service) SaveImage(ctx context.Context, data []byte) (mediadomain.Asset
 	return asset, nil
 }
 
+// DeleteVideoInputImage 精确回滚尚未被任务接管的暂存输入图片。
+func (s *Service) DeleteVideoInputImage(ctx context.Context, id string) error {
+	asset, err := s.assets.GetMediaAsset(ctx, strings.TrimSpace(id))
+	if errors.Is(err, repository.ErrNotFound) {
+		return ErrAssetNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if asset.Kind != "image" || asset.Purpose != mediadomain.AssetPurposeVideoInput || asset.StagedUntil == nil {
+		return fmt.Errorf("%w: 资源不是暂存视频输入图片", ErrInvalidImage)
+	}
+	deleted, err := s.deleteUnreferencedVideoInputAsset(ctx, asset, false)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return ErrAssetNotFound
+	}
+	s.subtractTotalBytes(asset.SizeBytes)
+	return nil
+}
+
+func (s *Service) subtractTotalBytes(size int64) {
+	for {
+		current := s.totalBytes.Load()
+		next := max(int64(0), current-size)
+		if s.totalBytes.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
 // PublicImageURL 返回可直接用于图片展示的公开资源地址。
 func (s *Service) PublicImageURL(id string) string {
 	return s.runtimeConfig().PublicBaseURL + "/v1/media/images/" + id
@@ -142,6 +193,15 @@ func (s *Service) PublicImageURL(id string) string {
 
 // OpenImage 读取图片元数据和正文，不向调用方暴露实际文件路径。
 func (s *Service) OpenImage(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error) {
+	return s.openImage(ctx, id, false)
+}
+
+// OpenInternalImage 读取包括视频输入在内的内部图片，仅供任务 Worker 使用。
+func (s *Service) OpenInternalImage(ctx context.Context, id string) (mediadomain.Asset, io.ReadCloser, error) {
+	return s.openImage(ctx, id, true)
+}
+
+func (s *Service) openImage(ctx context.Context, id string, internal bool) (mediadomain.Asset, io.ReadCloser, error) {
 	asset, err := s.assets.GetMediaAsset(ctx, strings.TrimSpace(id))
 	if errors.Is(err, repository.ErrNotFound) {
 		return mediadomain.Asset{}, nil, ErrAssetNotFound
@@ -149,7 +209,7 @@ func (s *Service) OpenImage(ctx context.Context, id string) (mediadomain.Asset, 
 	if err != nil {
 		return mediadomain.Asset{}, nil, err
 	}
-	if asset.Kind != "image" {
+	if asset.Kind != "image" || (!internal && asset.Purpose != mediadomain.AssetPurposeOutput) {
 		return mediadomain.Asset{}, nil, ErrAssetNotFound
 	}
 	body, err := s.objects.Open(ctx, asset.StorageKey)
@@ -197,6 +257,10 @@ func (s *Service) AdminDeleteImages(ctx context.Context, ids []string) (int, err
 	if len(ids) == 0 || len(ids) > 100 {
 		return 0, ErrInvalidImageSelection
 	}
+	protected, err := s.assets.ListProtectedMediaAssetIDs(ctx)
+	if err != nil {
+		return 0, err
+	}
 	unique := make(map[string]struct{}, len(ids))
 	assets := make([]mediadomain.Asset, 0, len(ids))
 	for _, rawID := range ids {
@@ -216,22 +280,25 @@ func (s *Service) AdminDeleteImages(ctx context.Context, ids []string) (int, err
 			return 0, err
 		}
 		if asset.Kind == "image" {
+			if _, active := protected[asset.ID]; active {
+				return 0, ErrActiveImageSelection
+			}
+			if asset.Purpose != mediadomain.AssetPurposeOutput {
+				return 0, ErrInvalidImageSelection
+			}
 			assets = append(assets, asset)
 		}
 	}
 
 	deleted := 0
 	for _, asset := range assets {
-		if err := s.objects.Delete(ctx, asset.StorageKey); err != nil && !errors.Is(err, os.ErrNotExist) {
+		removed, err := s.deleteAssetObject(ctx, asset, false)
+		if err != nil {
 			return deleted, err
 		}
-		if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil {
-			if errors.Is(err, repository.ErrNotFound) {
-				continue
-			}
-			return deleted, err
+		if removed {
+			deleted++
 		}
-		deleted++
 	}
 	if total, err := s.assets.TotalMediaAssetBytes(ctx); err == nil {
 		s.totalBytes.Store(total)
@@ -302,12 +369,32 @@ func (s *Service) AdminDeleteVideoJobs(ctx context.Context, ids []string) (int, 
 			}
 			return deleted, err
 		}
+		for _, assetID := range job.InputAssetIDs {
+			if err := s.deleteUnreferencedVideoInput(ctx, assetID); err != nil {
+				return deleted, err
+			}
+		}
 		deleted++
 	}
 	if total, err := s.assets.TotalMediaAssetBytes(ctx); err == nil {
 		s.totalBytes.Store(total)
 	}
 	return deleted, nil
+}
+
+func (s *Service) deleteUnreferencedVideoInput(ctx context.Context, assetID string) error {
+	asset, err := s.assets.GetMediaAsset(ctx, strings.TrimSpace(assetID))
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if asset.Kind != "image" || asset.Purpose != mediadomain.AssetPurposeVideoInput {
+		return nil
+	}
+	_, err = s.deleteUnreferencedVideoInputAsset(ctx, asset, false)
+	return err
 }
 
 // deleteVideoAsset 删除任务绑定的本地视频对象与元数据；缺失对象按幂等成功处理。
@@ -326,13 +413,45 @@ func (s *Service) deleteVideoAsset(ctx context.Context, assetID string) error {
 	if asset.Kind != "video" {
 		return nil
 	}
-	if err := s.objects.Delete(ctx, asset.StorageKey); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	_, err = s.deleteAssetObject(ctx, asset, false)
+	return err
+}
+
+func (s *Service) deleteAssetObject(ctx context.Context, asset mediadomain.Asset, restoreOnMissingObject bool) (bool, error) {
+	if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
 	}
-	if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil && !errors.Is(err, repository.ErrNotFound) {
-		return err
+	if err := s.deleteObjectAfterMetadata(ctx, asset, restoreOnMissingObject); err != nil {
+		return false, err
 	}
-	return nil
+	return true, nil
+}
+
+func (s *Service) deleteUnreferencedVideoInputAsset(ctx context.Context, asset mediadomain.Asset, restoreOnMissingObject bool) (bool, error) {
+	deleted, err := s.assets.DeleteUnreferencedVideoInputAsset(ctx, asset.ID)
+	if err != nil || !deleted {
+		return deleted, err
+	}
+	if err := s.deleteObjectAfterMetadata(ctx, asset, restoreOnMissingObject); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Service) deleteObjectAfterMetadata(ctx context.Context, asset mediadomain.Asset, restoreOnMissingObject bool) error {
+	err := s.objects.Delete(ctx, asset.StorageKey)
+	if err == nil || (errors.Is(err, os.ErrNotExist) && !restoreOnMissingObject) {
+		return nil
+	}
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if restoreErr := s.assets.CreateMediaAsset(restoreCtx, asset); restoreErr != nil {
+		return errors.Join(err, fmt.Errorf("恢复媒体资源元数据: %w", restoreErr))
+	}
+	return err
 }
 
 func mediaPageQuery(page, pageSize int, search string, sort repository.SortQuery) repository.PageQuery {
@@ -446,14 +565,18 @@ func (s *Service) Cleanup(ctx context.Context) (int, error) {
 			if _, skip := protected[asset.ID]; skip {
 				continue
 			}
-			if err := s.objects.Delete(ctx, asset.StorageKey); err != nil {
+			removed, err := s.deleteAssetObject(ctx, asset, true)
+			if err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					continue
+				}
 				if errors.Is(err, os.ErrNotExist) {
-					return deleted, fmt.Errorf("媒体对象缺失，已保留共享元数据: %s: %w", asset.StorageKey, err)
+					return deleted, fmt.Errorf("媒体对象缺失，已恢复元数据: %s: %w", asset.StorageKey, err)
 				}
 				return deleted, err
 			}
-			if err := s.assets.DeleteMediaAsset(ctx, asset.ID); err != nil && !errors.Is(err, repository.ErrNotFound) {
-				return deleted, err
+			if !removed {
+				continue
 			}
 			total = max(0, total-asset.SizeBytes)
 			deleted++

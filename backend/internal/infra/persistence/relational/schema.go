@@ -32,6 +32,7 @@ var schemaModels = []any{
 	&webResponseStateModel{},
 	&mediaJobModel{},
 	&mediaAssetModel{},
+	&mediaJobInputAssetModel{},
 	&mediaUploadTicketModel{},
 	&runtimeSettingsModel{},
 	&egressNodeModel{},
@@ -75,6 +76,9 @@ var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_usage_recovery ON media_jobs(status, usage_recorded_at, completed_at, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_created ON media_assets(created_at DESC, id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_assets_kind_created ON media_assets(kind, created_at DESC, id)",
+	"CREATE INDEX IF NOT EXISTS idx_media_assets_purpose_created ON media_assets(purpose, created_at DESC, id)",
+	"CREATE INDEX IF NOT EXISTS idx_media_assets_staged_until ON media_assets(staged_until, id) WHERE staged_until IS NOT NULL",
+	"CREATE INDEX IF NOT EXISTS idx_media_job_input_assets_asset ON media_job_input_assets(asset_id, job_id)",
 	"CREATE INDEX IF NOT EXISTS idx_media_upload_tickets_expires ON media_upload_tickets(expires_at, consumed_at)",
 	"CREATE INDEX IF NOT EXISTS idx_media_jobs_result_asset ON media_jobs(result_asset_id) WHERE result_asset_id <> ''",
 }
@@ -120,6 +124,9 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	if err := d.backfillWebEgressIdentities(ctx); err != nil {
 		return fmt.Errorf("迁移 Web 出口身份: %w", err)
 	}
+	if err := d.migrateVideoInputAssetPurposes(ctx); err != nil {
+		return fmt.Errorf("迁移视频输入图片用途: %w", err)
+	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
 			return fmt.Errorf("初始化数据库索引: %w", err)
@@ -129,6 +136,16 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 		return fmt.Errorf("迁移模型 Provider 命名空间: %w", err)
 	}
 	return nil
+}
+
+func (d *Database) migrateVideoInputAssetPurposes(ctx context.Context) error {
+	return d.db.WithContext(ctx).Exec(`
+		UPDATE media_assets
+		SET purpose = ?
+		WHERE kind = ?
+		  AND purpose <> ?
+		  AND id IN (SELECT asset_id FROM media_job_input_assets)
+	`, "video_input", "image", "video_input").Error
 }
 
 type consoleConstraint struct {
@@ -214,9 +231,14 @@ func (d *Database) ensureMediaAssetConstraints(ctx context.Context) error {
 	}, "video/mp4"); err != nil {
 		return err
 	}
-	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+	if err := d.ensureNamedConstraints(ctx, []consoleConstraint{
 		{model: &mediaAssetModel{}, table: "media_assets", name: "chk_media_assets_size"},
-	}, "268435456")
+	}, "268435456"); err != nil {
+		return err
+	}
+	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &mediaAssetModel{}, table: "media_assets", name: "chk_media_assets_purpose"},
+	}, "video_input")
 }
 
 // ensureNamedConstraints 在约束定义尚未包含 marker 时 drop/recreate；已升级则跳过。
