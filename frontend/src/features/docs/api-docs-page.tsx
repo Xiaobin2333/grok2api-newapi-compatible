@@ -36,6 +36,8 @@ type EndpointDefinition = {
   noteKeys: string[];
   request: (model: string) => Record<string, unknown> | undefined;
   response: Record<string, unknown>;
+  examplePath?: string;
+  responseKind?: "json" | "binary";
 };
 
 const exampleLanguages: ExampleLanguage[] = ["curl", "python", "javascript"];
@@ -95,13 +97,15 @@ const endpoints: Record<string, EndpointDefinition> = {
       { name: "model", required: true, descriptionKey: "docs.reference.fieldModel" },
       { name: "prompt", required: true, descriptionKey: "docs.reference.fieldPrompt" },
       { name: "n", descriptionKey: "docs.reference.fieldImageCount" },
+      { name: "size", descriptionKey: "docs.reference.fieldSize" },
+      { name: "quality", descriptionKey: "docs.reference.fieldImageQuality" },
       { name: "aspect_ratio", descriptionKey: "docs.reference.fieldAspectRatio" },
       { name: "resolution", descriptionKey: "docs.reference.fieldResolution" },
       { name: "response_format", descriptionKey: "docs.reference.fieldResponseFormat" },
       { name: "stream", descriptionKey: "docs.reference.fieldImageStream" },
     ],
-    noteKeys: ["docs.reference.noteImageCount", "docs.reference.noteImageStorage"],
-    request: (model) => ({ model, prompt: "A minimal red chair in a bright studio", n: 1, response_format: "url" }),
+    noteKeys: ["docs.reference.noteImageOpenAICompatibility", "docs.reference.noteImageCount", "docs.reference.noteImageStorage"],
+    request: (model) => ({ model, prompt: "A minimal red chair in a bright studio", n: 1, size: "1024x1024", quality: "standard", response_format: "url" }),
     response: { created: 1783860000, data: [{ url: "http://127.0.0.1:8000/v1/media/images/example" }] },
   },
   "image/edits": {
@@ -119,7 +123,7 @@ const endpoints: Record<string, EndpointDefinition> = {
     response: { created: 1783860000, data: [{ url: "http://127.0.0.1:8000/v1/media/images/example" }] },
   },
   "video/generations": {
-    key: "video/generations", category: "Video", title: "Video generations", method: "POST", path: "/videos/generations",
+    key: "video/generations", category: "Video", title: "xAI Video Generations", method: "POST", path: "/videos/generations",
     descriptionKey: "docs.endpointVideoCreate", capabilities: ["video"],
     fields: [
       { name: "model", required: true, descriptionKey: "docs.reference.fieldModel" },
@@ -135,12 +139,46 @@ const endpoints: Record<string, EndpointDefinition> = {
     response: { request_id: "video_example" },
   },
   "video/get": {
-    key: "video/get", category: "Video", title: "Get video", method: "GET", path: "/videos/{request_id}",
+    key: "video/get", category: "Video", title: "Get xAI Video", method: "GET", path: "/videos/{request_id}",
     descriptionKey: "docs.endpointVideoGet", capabilities: ["video"],
     fields: [{ name: "request_id", required: true, descriptionKey: "docs.reference.fieldRequestId" }],
     noteKeys: ["docs.reference.noteVideoPolling", "docs.reference.noteVideoStatus"],
     request: () => undefined,
-    response: { status: "done", model: "grok-imagine-video", progress: 100, video: { url: "https://example.com/generated.mp4", duration: 8, respect_moderation: true } },
+    response: { status: "done", model: "grok-imagine-video", progress: 100, video: { url: "http://127.0.0.1:8000/v1/videos/video_example/content", duration: 8, respect_moderation: true } },
+    examplePath: "/videos/video_example",
+  },
+  "video/openai": {
+    key: "video/openai", category: "Video", title: "OpenAI / NewAPI Video", method: "POST", path: "/videos",
+    descriptionKey: "docs.endpointOpenAIVideoCreate", capabilities: ["video"],
+    fields: [
+      { name: "model", required: true, descriptionKey: "docs.reference.fieldModel" },
+      { name: "prompt", required: true, descriptionKey: "docs.reference.fieldVideoPrompt" },
+      { name: "seconds", descriptionKey: "docs.reference.fieldVideoSeconds" },
+      { name: "size", descriptionKey: "docs.reference.fieldVideoSize" },
+      { name: "input_reference", descriptionKey: "docs.reference.fieldInputReference" },
+    ],
+    noteKeys: ["docs.reference.noteOpenAIVideoCompatibility", "docs.reference.noteOpenAIVideoMultipart", "docs.reference.noteVideoBoundAccount"],
+    request: (model) => ({ model, prompt: "A paper airplane flying over a city", seconds: "8", size: "1280x720" }),
+    response: { id: "video_oai_example", object: "video", model: "grok-imagine-video", status: "queued", progress: 0, created_at: 1783860000, seconds: "8", size: "1280x720" },
+  },
+  "video/openai-get": {
+    key: "video/openai-get", category: "Video", title: "Get OpenAI / NewAPI Video", method: "GET", path: "/videos/{video_id}",
+    descriptionKey: "docs.endpointOpenAIVideoGet", capabilities: ["video"],
+    fields: [{ name: "video_id", required: true, descriptionKey: "docs.reference.fieldVideoId" }],
+    noteKeys: ["docs.reference.noteOpenAIVideoPolling", "docs.reference.noteOpenAIVideoContent"],
+    request: () => undefined,
+    response: { id: "video_oai_example", object: "video", model: "grok-imagine-video", status: "completed", progress: 100, created_at: 1783860000, completed_at: 1783860060, seconds: "8", size: "1280x720" },
+    examplePath: "/videos/video_oai_example",
+  },
+  "video/content": {
+    key: "video/content", category: "Video", title: "Download Video Content", method: "GET", path: "/videos/{video_id}/content",
+    descriptionKey: "docs.endpointVideoContent", capabilities: ["video"],
+    fields: [{ name: "video_id", required: true, descriptionKey: "docs.reference.fieldVideoId" }],
+    noteKeys: ["docs.reference.noteOpenAIVideoContent", "docs.reference.noteVideoBoundAccount"],
+    request: () => undefined,
+    response: { content_type: "video/mp4", body: "<binary video stream>" },
+    examplePath: "/videos/video_oai_example/content",
+    responseKind: "binary",
   },
 };
 
@@ -231,26 +269,28 @@ function fallbackModel(key: string): string {
 
 function createExamples(definition: EndpointDefinition, baseUrl: string, model: string): Record<ExampleLanguage, string> {
   const request = definition.request(model);
-  const url = `${baseUrl}${definition.path.replace("{request_id}", "video_example")}`;
+  const url = `${baseUrl}${definition.examplePath ?? definition.path.replace("{request_id}", "video_example").replace("{video_id}", "video_oai_example")}`;
   const messageHeaders = definition.key === "chat/messages";
-  const curlHeaders = messageHeaders
-    ? [
-        '  -H "x-api-key: $GROK2API_API_KEY"',
-        '  -H "anthropic-version: 2023-06-01"',
-        '  -H "Content-Type: application/json"',
-      ].join(" \\\n")
-    : [
-        '  -H "Authorization: Bearer $GROK2API_API_KEY"',
-        '  -H "Content-Type: application/json"',
-      ].join(" \\\n");
+  const curlHeaderValues = messageHeaders
+    ? ['  -H "x-api-key: $GROK2API_API_KEY"', '  -H "anthropic-version: 2023-06-01"']
+    : ['  -H "Authorization: Bearer $GROK2API_API_KEY"'];
+  if (request) curlHeaderValues.push('  -H "Content-Type: application/json"');
+  const curlHeaders = curlHeaderValues.join(" \\\n");
   const curlBody = request ? ` \\\n  -d '${JSON.stringify(request, null, 2)}'` : "";
   const headers = messageHeaders
-    ? { "x-api-key": "g2a_your_api_key", "anthropic-version": "2023-06-01", "Content-Type": "application/json" }
-    : { Authorization: "Bearer g2a_your_api_key", "Content-Type": "application/json" };
+    ? { "x-api-key": "g2a_your_api_key", "anthropic-version": "2023-06-01", ...(request ? { "Content-Type": "application/json" } : {}) }
+    : { Authorization: "Bearer g2a_your_api_key", ...(request ? { "Content-Type": "application/json" } : {}) };
   const pythonImports = request ? "import json\nimport requests" : "import requests";
   const pythonPayload = request ? `\n\npayload = json.loads(r'''${JSON.stringify(request, null, 2)}''')` : "";
   const pythonBody = request ? ",\n    json=payload" : "";
   const javascriptBody = request ? `,\n  body: JSON.stringify(${JSON.stringify(request, null, 2)})` : "";
+  if (definition.responseKind === "binary") {
+    return {
+      curl: `export GROK2API_API_KEY="g2a_your_api_key"\n\ncurl -fL "${url}" \\\n${curlHeaders} \\\n  --output generated-video.mp4`,
+      python: `${pythonImports}\n\nresponse = requests.get(\n    "${url}",\n    headers=${JSON.stringify(headers, null, 2)}\n)\nresponse.raise_for_status()\nwith open("generated-video.mp4", "wb") as video_file:\n    video_file.write(response.content)`,
+      javascript: `const response = await fetch("${url}", {\n  method: "GET",\n  headers: ${JSON.stringify(headers, null, 2)}\n});\n\nif (!response.ok) throw new Error(await response.text());\nconst videoBlob = await response.blob();\nconsole.log(videoBlob.type, videoBlob.size);`,
+    };
+  }
   return {
     curl: `export GROK2API_API_KEY="g2a_your_api_key"\n\ncurl -X ${definition.method} "${url}" \\\n${curlHeaders}${curlBody}`,
     python: `${pythonImports}${pythonPayload}\n\nresponse = requests.${definition.method.toLowerCase()}(\n    "${url}",\n    headers=${JSON.stringify(headers, null, 2)}${pythonBody}\n)\nresponse.raise_for_status()\nprint(response.json())`,

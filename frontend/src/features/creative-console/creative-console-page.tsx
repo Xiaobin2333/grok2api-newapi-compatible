@@ -617,8 +617,16 @@ function VideoPanel({ apiKey, model, modelOptions, onModelChange }: CreativePane
     queryFn: ({ signal }) => getVideo({ apiKey: job!.apiKey, requestId: job!.requestId, signal }),
     enabled: Boolean(job),
     refetchInterval: (query) => query.state.data?.status === "pending" ? 3_000 : false,
+    refetchOnWindowFocus: false,
     retry: 2,
   });
+
+  const videoURL = statusQuery.data?.video?.url;
+  useEffect(() => {
+    return () => {
+      if (videoURL?.startsWith("blob:")) URL.revokeObjectURL(videoURL);
+    };
+  }, [videoURL]);
 
   function submit(event: FormEvent): void {
     event.preventDefault();

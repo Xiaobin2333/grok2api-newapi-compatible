@@ -53,8 +53,11 @@ const documentation = [
     label: "Video",
     icon: Video,
     items: [
-      { href: "/docs/video/generations", label: "Video Generations", method: "POST" },
-      { href: "/docs/video/get", label: "Get Video", method: "GET" },
+      { href: "/docs/video/generations", label: "Create Video (xAI)", method: "POST" },
+      { href: "/docs/video/get", label: "Get Video (xAI)", method: "GET" },
+      { href: "/docs/video/openai", label: "Create Video (OpenAI)", method: "POST" },
+      { href: "/docs/video/openai-get", label: "Get Video (OpenAI)", method: "GET" },
+      { href: "/docs/video/content", label: "Video Content", method: "GET" },
     ],
   },
 ] as const;

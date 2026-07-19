@@ -152,7 +152,31 @@ export async function getVideo(input: {
     { method: "GET", signal: input.signal },
   );
   const status = readVideoStatus(payload);
-  return status.video ? { ...status, video: { ...status.video, url: resolveMediaURL(status.video.url) } } : status;
+  if (!status.video) return status;
+  const videoURL = await getVideoContentURL(input.apiKey, input.requestId, input.signal);
+  return { ...status, video: { ...status.video, url: videoURL } };
+}
+
+async function getVideoContentURL(apiKey: string, requestId: string, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(`/v1/videos/${encodeURIComponent(requestId)}/content`, {
+    headers: { Accept: "video/*", Authorization: `Bearer ${apiKey}` },
+    signal,
+  });
+  if (!response.ok) {
+    const responseText = await response.text();
+    let payload: unknown = null;
+    if (responseText) {
+      try {
+        payload = JSON.parse(responseText);
+      } catch {
+        payload = null;
+      }
+    }
+    const error = readError(payload);
+    const fallback = responseText.trim() || response.statusText || `HTTP ${response.status}`;
+    throw new CreativeApiError(response.status, error.message ?? fallback, error.code);
+  }
+  return URL.createObjectURL(await response.blob());
 }
 
 async function publicApiRequest(apiKey: string, path: string, options: RequestOptions): Promise<unknown> {
