@@ -374,6 +374,7 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 			s.deferVideoJob(parent, job)
 			return
 		}
+		s.logger.Error("video_upstream_failed", "event_id", "video_usage_"+job.ID, "request_id", job.RequestID, "model", job.Model, "provider", route.Provider, "account_id", lease.Credential.ID, "error", err)
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
 		if errors.Is(err, provider.ErrUnauthorized) {
