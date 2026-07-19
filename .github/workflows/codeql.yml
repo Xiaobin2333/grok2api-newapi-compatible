@@ -35,7 +35,7 @@ jobs:
             build-mode: none
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -49,10 +49,11 @@ jobs:
           category: /language:${{ matrix.language }}
           output: sarif-results
           upload: ${{ github.event.repository.private && 'never' || 'always' }}
+          upload-database: ${{ !github.event.repository.private }}
 
       - name: Upload private repository SARIF
         if: ${{ github.event.repository.private && always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: codeql-${{ matrix.language }}-sarif
           path: sarif-results
