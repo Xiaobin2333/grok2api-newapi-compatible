@@ -1674,6 +1674,12 @@ func (a *webImageStreamAdapter) GenerateImage(ctx context.Context, request provi
 		lease.Release()
 		return nil, errors.New("simulated image transport failure")
 	}
+	if request.Model == "grok-imagine-image" {
+		return &provider.Response{
+			StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"created":1,"data":[{"url":"https://example.com/lite.png"}]}`)), QuotaUnits: 1,
+		}, nil
+	}
 	body := "event: image_generation.completed\ndata: {}\n\ndata: [DONE]\n\n"
 	return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body)), QuotaUnits: 1}, nil
 }

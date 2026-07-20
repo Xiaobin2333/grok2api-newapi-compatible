@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -22,6 +23,7 @@ import (
 )
 
 type failureAttemptRecorder struct {
+	mu                  sync.Mutex
 	method              string
 	path                string
 	remainingBodyBudget int
@@ -195,12 +197,16 @@ func (r *failureAttemptRecorder) captureStreamFailure(credential accountdomain.C
 }
 
 func (r *failureAttemptRecorder) append(attempt audit.Attempt) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	attempt.Number = len(r.attempts) + 1
 	r.attempts = append(r.attempts, attempt)
 }
 
 // captureBody 在单次和单请求预算内保留可读的脱敏正文片段。
 func (r *failureAttemptRecorder) captureBody(body []byte, alreadyTruncated bool) ([]byte, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(body) == 0 {
 		return nil, alreadyTruncated
 	}
@@ -221,6 +227,8 @@ func (r *failureAttemptRecorder) captureBody(body []byte, alreadyTruncated bool)
 }
 
 func (r *failureAttemptRecorder) snapshot() []audit.Attempt {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return append([]audit.Attempt(nil), r.attempts...)
 }
 
