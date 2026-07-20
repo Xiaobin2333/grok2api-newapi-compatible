@@ -281,6 +281,9 @@ type requestAuditModel struct {
 	ModelRouteID            uint64    `gorm:"not null;check:chk_request_audits_model_route_id,model_route_id > 0"`
 	ModelPublicID           string    `gorm:"size:255;check:chk_request_audits_model_public_id,length(model_public_id) <= 255"`
 	ModelUpstreamModel      string    `gorm:"size:255;check:chk_request_audits_model_upstream_model,length(model_upstream_model) <= 255"`
+	RequestedModel          string    `gorm:"size:255;not null;default:'';check:chk_request_audits_requested_model,length(requested_model) <= 255"`
+	EffectiveModel          string    `gorm:"size:255;not null;default:'';check:chk_request_audits_effective_model,length(effective_model) <= 255"`
+	AutoRouted              bool      `gorm:"not null;default:false"`
 	Provider                string    `gorm:"size:32;not null;check:chk_request_audits_provider,provider IN ('grok_build','grok_web','grok_console')"`
 	Operation               string    `gorm:"size:32;not null;check:chk_request_audits_operation,operation IN ('responses','compaction','chat','messages','image','image_edit','video')"`
 	UsageSource             string    `gorm:"size:16;not null;check:chk_request_audits_usage_source,usage_source IN ('upstream','estimated','none')"`

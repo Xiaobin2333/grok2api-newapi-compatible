@@ -75,6 +75,9 @@ type Record struct {
 	ModelRouteID            uint64
 	ModelPublicID           string
 	ModelUpstreamModel      string
+	RequestedModel          string
+	EffectiveModel          string
+	AutoRouted              bool
 	Provider                string
 	Operation               Operation
 	UsageSource             UsageSource

@@ -4,16 +4,24 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +44,11 @@ const (
 )
 
 var errLiteImageReady = errors.New("Lite 图片已完成")
+
+var (
+	chineseImageReferencePattern = regexp.MustCompile(`图片\s*([1-9][0-9]*)`)
+	englishImageReferencePattern = regexp.MustCompile(`(?i)\bimage\s+([1-9][0-9]*)\b`)
+)
 
 type directFileUploadUnsupportedError struct{ statusCode int }
 
@@ -739,6 +752,9 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 		}
 		images = append(images, image)
 	}
+	if strings.TrimSpace(request.AspectRatio) != "" {
+		request.ImageURLs, images, request.Prompt = reorderLocalImageReferences(request.ImageURLs, images, request.Prompt, ratio)
+	}
 	refs := make([]string, 0, len(images))
 	parentID := ""
 	directUploadAvailable := true
@@ -795,6 +811,152 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 		result.QuotaUnits = 1
 	}
 	return result, err
+}
+
+func reorderLocalImageReferences(rawURLs []string, images []provider.ImageInput, prompt, aspectRatio string) ([]string, []provider.ImageInput, string) {
+	if len(rawURLs) != len(images) || len(images) < 2 {
+		return rawURLs, images, prompt
+	}
+	targetRatio, ok := numericAspectRatio(aspectRatio)
+	if !ok {
+		return rawURLs, images, prompt
+	}
+	bestIndex := -1
+	bestDistance := math.Inf(1)
+	for index, rawURL := range rawURLs {
+		if !isLocalMediaImageURL(rawURL) {
+			continue
+		}
+		width, height, ok := referenceImageDimensions(images[index])
+		if !ok {
+			continue
+		}
+		actualRatio := float64(width) / float64(height)
+		distance := math.Abs(math.Log(actualRatio / targetRatio))
+		if distance < bestDistance {
+			bestIndex = index
+			bestDistance = distance
+		}
+	}
+	if bestIndex <= 0 {
+		return rawURLs, images, prompt
+	}
+
+	orderedURLs := moveReferenceFirst(rawURLs, bestIndex)
+	orderedImages := moveReferenceFirst(images, bestIndex)
+	oldToNew := make([]int, len(images))
+	for newIndex, oldIndex := range referenceOrder(len(images), bestIndex) {
+		oldToNew[oldIndex] = newIndex + 1
+	}
+	return orderedURLs, orderedImages, rewriteImageReferenceNumbers(prompt, oldToNew)
+}
+
+func referenceImageDimensions(input provider.ImageInput) (int, int, bool) {
+	config, _, err := image.DecodeConfig(bytes.NewReader(input.Data))
+	if err == nil && config.Width > 0 && config.Height > 0 {
+		return config.Width, config.Height, true
+	}
+	if input.MIMEType != "image/webp" {
+		return 0, 0, false
+	}
+	return webPDimensions(input.Data)
+}
+
+func webPDimensions(data []byte) (int, int, bool) {
+	if len(data) < 20 || string(data[:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+		return 0, 0, false
+	}
+	for offset := 12; offset+8 <= len(data); {
+		chunkSize := int(binary.LittleEndian.Uint32(data[offset+4 : offset+8]))
+		payloadStart := offset + 8
+		payloadEnd := payloadStart + chunkSize
+		if chunkSize < 0 || payloadEnd < payloadStart || payloadEnd > len(data) {
+			return 0, 0, false
+		}
+		payload := data[payloadStart:payloadEnd]
+		switch string(data[offset : offset+4]) {
+		case "VP8X":
+			if len(payload) >= 10 {
+				width := 1 + int(payload[4]) + int(payload[5])<<8 + int(payload[6])<<16
+				height := 1 + int(payload[7]) + int(payload[8])<<8 + int(payload[9])<<16
+				return width, height, true
+			}
+		case "VP8L":
+			if len(payload) >= 5 && payload[0] == 0x2f {
+				bits := binary.LittleEndian.Uint32(payload[1:5])
+				return int(bits&0x3fff) + 1, int((bits>>14)&0x3fff) + 1, true
+			}
+		case "VP8 ":
+			if len(payload) >= 10 && payload[3] == 0x9d && payload[4] == 0x01 && payload[5] == 0x2a {
+				width := int(binary.LittleEndian.Uint16(payload[6:8]) & 0x3fff)
+				height := int(binary.LittleEndian.Uint16(payload[8:10]) & 0x3fff)
+				return width, height, width > 0 && height > 0
+			}
+		}
+		offset = payloadEnd + chunkSize%2
+	}
+	return 0, 0, false
+}
+
+func numericAspectRatio(value string) (float64, bool) {
+	left, right, ok := strings.Cut(strings.TrimSpace(value), ":")
+	if !ok {
+		return 0, false
+	}
+	width, widthErr := strconv.ParseFloat(strings.TrimSpace(left), 64)
+	height, heightErr := strconv.ParseFloat(strings.TrimSpace(right), 64)
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
+		return 0, false
+	}
+	return width / height, true
+}
+
+func isLocalMediaImageURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return false
+	}
+	const marker = "/v1/media/images/"
+	index := strings.LastIndex(parsed.EscapedPath(), marker)
+	return index >= 0 && strings.Trim(strings.TrimPrefix(parsed.EscapedPath()[index:], marker), "/") != ""
+}
+
+func referenceOrder(length, first int) []int {
+	order := make([]int, 0, length)
+	order = append(order, first)
+	for index := 0; index < length; index++ {
+		if index != first {
+			order = append(order, index)
+		}
+	}
+	return order
+}
+
+func moveReferenceFirst[T any](values []T, first int) []T {
+	order := referenceOrder(len(values), first)
+	result := make([]T, 0, len(values))
+	for _, index := range order {
+		result = append(result, values[index])
+	}
+	return result
+}
+
+func rewriteImageReferenceNumbers(prompt string, oldToNew []int) string {
+	rewrite := func(pattern *regexp.Regexp, value string) string {
+		return pattern.ReplaceAllStringFunc(value, func(match string) string {
+			positions := pattern.FindStringSubmatchIndex(match)
+			if len(positions) < 4 {
+				return match
+			}
+			oldNumber, err := strconv.Atoi(match[positions[2]:positions[3]])
+			if err != nil || oldNumber <= 0 || oldNumber > len(oldToNew) {
+				return match
+			}
+			return match[:positions[2]] + strconv.Itoa(oldToNew[oldNumber-1]) + match[positions[3]:]
+		})
+	}
+	prompt = rewrite(chineseImageReferencePattern, prompt)
+	return rewrite(englishImageReferencePattern, prompt)
 }
 
 func buildImageEditPayload(prompt string, refs []string, parentID, aspectRatio string) map[string]any {

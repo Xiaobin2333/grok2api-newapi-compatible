@@ -84,25 +84,28 @@ export async function generateImage(input: {
   apiKey: string;
   model: string;
   prompt: string;
+  referenceImages?: Array<string | { url: string }>;
   count: number;
   aspectRatio: string;
   resolution: string;
   signal?: AbortSignal;
 }): Promise<ImageResult[]> {
+  const body: Record<string, unknown> = {
+    model: input.model,
+    prompt: input.prompt,
+    n: input.count,
+    aspect_ratio: input.aspectRatio,
+    resolution: input.resolution,
+    response_format: "url",
+    stream: false,
+  };
+  if (input.referenceImages?.length) body.images = input.referenceImages;
   const payload = await publicApiRequest(
     input.apiKey,
     "/images/generations",
     {
       method: "POST",
-      body: {
-        model: input.model,
-        prompt: input.prompt,
-        n: input.count,
-        aspect_ratio: input.aspectRatio,
-        resolution: input.resolution,
-        response_format: "url",
-        stream: false,
-      },
+      body,
       signal: input.signal,
     },
   );

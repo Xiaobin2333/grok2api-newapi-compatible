@@ -277,6 +277,34 @@ func TestAuditRepositoryNormalizesUntrustedUsage(t *testing.T) {
 	}
 }
 
+func TestAuditRepositoryRoundTripsImageRouteMetadata(t *testing.T) {
+	ctx := context.Background()
+	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-image-route.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewAuditRepository(database)
+	if err := repository.Create(ctx, audit.Record{
+		EventID: "evt_image_route_0001", RequestID: "image-route", ClientKeyID: 1, ModelRouteID: 1,
+		RequestedModel: "grok-imagine-image", EffectiveModel: "grok-imagine-image-edit", AutoRouted: true,
+		Operation: audit.OperationImageEdit, StatusCode: http.StatusOK, MediaInputImages: 2, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	values, total, err := repository.List(ctx, 0, 10)
+	if err != nil || total != 1 || len(values) != 1 {
+		t.Fatalf("audits = %#v, total = %d, err = %v", values, total, err)
+	}
+	got := values[0]
+	if got.RequestedModel != "grok-imagine-image" || got.EffectiveModel != "grok-imagine-image-edit" || !got.AutoRouted || got.MediaInputImages != 2 {
+		t.Fatalf("audit = %#v", got)
+	}
+}
+
 func TestAuditRepositorySummaryAppliesRangeAndGroupsPricingTier(t *testing.T) {
 	ctx := context.Background()
 	database, err := OpenSQLite(ctx, filepath.Join(t.TempDir(), "audit-summary.db"))

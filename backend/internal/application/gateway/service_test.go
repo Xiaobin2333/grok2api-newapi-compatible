@@ -1142,7 +1142,8 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	}
 
 	editResult, err := service.EditImage(ctx, ImageEditInput{
-		RequestID: "req-image-edit", ClientKey: key, PublicModel: "grok-imagine-image-edit",
+		RequestID: "req-image-edit", ClientKey: key, PublicModel: "grok-imagine-image",
+		RequestedModel: "grok-imagine-image", EffectiveModel: "grok-imagine-image-edit", AutoRouted: true,
 		Prompt: "edit", ImageURLs: []string{"data:image/png;base64,a", "data:image/png;base64,b"},
 		Count: 3, Size: "1024x1024", AspectRatio: "1:1", Resolution: "2k", ResponseFormat: "url",
 		Streaming: true, PartialImages: 2,
@@ -1154,7 +1155,7 @@ func TestImageStreamPropagatesWithoutTouchingChatQuota(t *testing.T) {
 	editResult.Finalize(Usage{}, "", "")
 	_ = editResult.Body.Close()
 	logs, total, err = auditRepo.List(ctx, 0, 10)
-	if err != nil || total != 4 || logs[0].RequestID != "req-image-edit" || logs[0].MediaInputImages != 2 || logs[0].MediaOutputImages != 3 || logs[0].PricingModel != "grok-imagine-image-edit-2k" || logs[0].EstimatedCostInUSDTicks != 2_300_000_000 {
+	if err != nil || total != 4 || logs[0].RequestID != "req-image-edit" || logs[0].MediaInputImages != 2 || logs[0].MediaOutputImages != 3 || logs[0].PricingModel != "grok-imagine-image-edit-2k" || logs[0].EstimatedCostInUSDTicks != 2_300_000_000 || logs[0].RequestedModel != "grok-imagine-image" || logs[0].EffectiveModel != "grok-imagine-image-edit" || !logs[0].AutoRouted {
 		t.Fatalf("image edit pricing audit = %#v, total=%d, err=%v", logs, total, err)
 	}
 	editRequest := adapter.EditRequest()

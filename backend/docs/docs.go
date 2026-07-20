@@ -122,6 +122,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
+                "description": "接受 grok-imagine-image 或 grok-imagine-image-edit；前者会在渠道选择、计费和审计前规范为 grok-imagine-image-edit。请求必须提供至少一张参考图。\nimage 接受 URL 字符串或 {\"url\":\"...\"} 对象；images 接受二者混合数组；image_urls 接受 URL 字符串数组。多字段按请求中出现顺序合并、去重。",
                 "consumes": [
                     "application/json"
                 ],
@@ -168,6 +169,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
+                "description": "grok-imagine-image 在没有参考图时执行图片生成；提供 image、images 或 image_urls 后自动按 grok-imagine-image-edit 执行图片编辑。grok-imagine-image-edit 必须提供至少一张参考图。\nimage 接受 URL 字符串或 {\"url\":\"...\"} 对象；images 接受二者混合数组；image_urls 接受 URL 字符串数组。多字段按请求中出现顺序合并、去重。\n自动路由不改变 OpenAI Images 响应格式，url、b64_json 与扩展 SSE 流均保持兼容。",
                 "consumes": [
                     "application/json"
                 ],
@@ -702,11 +704,26 @@ const docTemplate = `{
                     "example": "1:1"
                 },
                 "image": {
-                    "$ref": "#/definitions/httpserver.SwaggerImageReference"
+                    "description": "Image 接受 URL 字符串或包含 url 的对象。"
+                },
+                "image_urls": {
+                    "description": "ImageURLs 接受 URL 字符串数组。",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "https://example.com/source.png"
+                    ]
+                },
+                "images": {
+                    "description": "Images 接受 URL 字符串和包含 url 的对象组成的混合数组。",
+                    "type": "array",
+                    "items": {}
                 },
                 "model": {
                     "type": "string",
-                    "example": "grok-imagine-image-edit"
+                    "example": "grok-imagine-image"
                 },
                 "n": {
                     "type": "integer",
@@ -732,6 +749,10 @@ const docTemplate = `{
                     "type": "string",
                     "example": "1024x1024"
                 },
+                "storage_options": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
                 "stream": {
                     "type": "boolean",
                     "example": false
@@ -745,9 +766,28 @@ const docTemplate = `{
                     "type": "string",
                     "example": "16:9"
                 },
+                "image": {
+                    "description": "Image 接受 URL 字符串或包含 url 的对象。"
+                },
+                "image_urls": {
+                    "description": "ImageURLs 接受 URL 字符串数组。",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "example": [
+                        "https://example.com/character.png",
+                        "https://example.com/scene.png"
+                    ]
+                },
+                "images": {
+                    "description": "Images 接受 URL 字符串和包含 url 的对象组成的混合数组。",
+                    "type": "array",
+                    "items": {}
+                },
                 "model": {
                     "type": "string",
-                    "example": "grok-imagine-image-quality"
+                    "example": "grok-imagine-image"
                 },
                 "n": {
                     "type": "integer",
@@ -759,7 +799,7 @@ const docTemplate = `{
                 },
                 "prompt": {
                     "type": "string",
-                    "example": "A cinematic city at night"
+                    "example": "Place image 1 in the setting from image 2"
                 },
                 "quality": {
                     "type": "string",
@@ -775,20 +815,15 @@ const docTemplate = `{
                 },
                 "size": {
                     "type": "string",
-                    "example": "1024x1024"
+                    "example": "1536x1024"
+                },
+                "storage_options": {
+                    "type": "object",
+                    "additionalProperties": {}
                 },
                 "stream": {
                     "type": "boolean",
                     "example": false
-                }
-            }
-        },
-        "httpserver.SwaggerImageReference": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "example": "https://example.com/source.png"
                 }
             }
         },

@@ -2,6 +2,7 @@ package inference
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,15 +12,68 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/application/gateway"
+	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
+	"github.com/chenyme/grok2api/backend/internal/transport/http/middleware"
 	"github.com/gin-gonic/gin"
 )
+
+type recordingImageGateway struct {
+	generationInputs []gateway.ImageGenerationInput
+	editInputs       []gateway.ImageEditInput
+	editErr          error
+}
+
+func (g *recordingImageGateway) GenerateImage(_ context.Context, input gateway.ImageGenerationInput) (*gateway.Result, error) {
+	g.generationInputs = append(g.generationInputs, input)
+	return imageHandlerTestResult(input.Streaming, input.ResponseFormat), nil
+}
+
+func (g *recordingImageGateway) EditImage(_ context.Context, input gateway.ImageEditInput) (*gateway.Result, error) {
+	g.editInputs = append(g.editInputs, input)
+	if g.editErr != nil {
+		return nil, g.editErr
+	}
+	return imageHandlerTestResult(input.Streaming, input.ResponseFormat), nil
+}
+
+func imageHandlerTestResult(streaming bool, responseFormat string) *gateway.Result {
+	body := "{\"created\":1,\"data\":[{\"url\":\"https://example.com/output.png\"}]}"
+	if responseFormat == "b64_json" {
+		body = "{\"created\":1,\"data\":[{\"b64_json\":\"aW1hZ2U=\"}]}"
+	}
+	if streaming {
+		body = "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\"}\n\ndata: [DONE]\n\n"
+	}
+	return &gateway.Result{
+		StatusCode: http.StatusOK,
+		Status:     http.StatusText(http.StatusOK),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Finalize:   func(gateway.Usage, string, string) {},
+	}
+}
+
+func imageHandlerTestRouter(images imageGateway) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set(middleware.ClientKey, clientkeydomain.Key{ID: 7})
+		c.Set(middleware.RequestIDKey, "req-image-route")
+		c.Next()
+	})
+	handler := NewHandler(nil, nil, 1<<20)
+	handler.images = images
+	handler.Register(router.Group("/v1"))
+	return router
+}
 
 func TestVideoGenerationUsesOfficialXAIEndpointsAndFields(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -555,6 +609,136 @@ func TestImageGenerationAcceptsOpenAIQuality(t *testing.T) {
 	router.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusUnauthorized || !strings.Contains(recorder.Body.String(), "invalid_api_key") {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestImageGenerationAutomaticallyRoutesReferencesToEdit(t *testing.T) {
+	images := &recordingImageGateway{}
+	router := imageHandlerTestRouter(images)
+
+	textRequest := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"model":"grok-imagine-image","prompt":"draw","n":2,"size":"1536x1024",
+		"aspect_ratio":"16:9","resolution":"1k","response_format":"b64_json"
+	}`))
+	textRequest.Header.Set("Content-Type", "application/json")
+	textRecorder := httptest.NewRecorder()
+	router.ServeHTTP(textRecorder, textRequest)
+	if textRecorder.Code != http.StatusOK || len(images.generationInputs) != 1 || len(images.editInputs) != 0 {
+		t.Fatalf("text route status=%d generations=%#v edits=%#v body=%s", textRecorder.Code, images.generationInputs, images.editInputs, textRecorder.Body.String())
+	}
+	if input := images.generationInputs[0]; input.PublicModel != "grok-imagine-image" || input.RequestedModel != "grok-imagine-image" || input.EffectiveModel != "grok-imagine-image" || input.AutoRouted || input.Count != 2 || input.Size != "1536x1024" || input.AspectRatio != "16:9" || input.Resolution != "1k" || input.ResponseFormat != "b64_json" {
+		t.Fatalf("generation input = %#v", input)
+	}
+
+	editRequest := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"model":"grok-imagine-image","prompt":"combine 图片1 and image 2","n":1,
+		"image_urls":["https://example.com/scene.png","https://example.com/shared.png"],
+		"image":{"url":"https://example.com/character.png"},
+		"images":["https://example.com/shared.png",{"url":"https://example.com/style.png"}],
+		"size":"1536x1024","aspect_ratio":"16:9","resolution":"1k","response_format":"url",
+		"stream":true,"partial_images":2
+	}`))
+	editRequest.Header.Set("Content-Type", "application/json")
+	editRecorder := httptest.NewRecorder()
+	router.ServeHTTP(editRecorder, editRequest)
+	if editRecorder.Code != http.StatusOK || len(images.editInputs) != 1 {
+		t.Fatalf("edit route status=%d edits=%#v body=%s", editRecorder.Code, images.editInputs, editRecorder.Body.String())
+	}
+	wantURLs := []string{
+		"https://example.com/scene.png",
+		"https://example.com/shared.png",
+		"https://example.com/character.png",
+		"https://example.com/style.png",
+	}
+	input := images.editInputs[0]
+	if input.PublicModel != "grok-imagine-image-edit" || input.RequestedModel != "grok-imagine-image" || input.EffectiveModel != "grok-imagine-image-edit" || !input.AutoRouted || !slices.Equal(input.ImageURLs, wantURLs) || input.Count != 1 || input.Size != "1536x1024" || input.AspectRatio != "16:9" || input.Resolution != "1k" || input.ResponseFormat != "url" || !input.Streaming || input.PartialImages != 2 {
+		t.Fatalf("edit input = %#v", input)
+	}
+	b64Request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"model":"grok-imagine-image-edit","prompt":"edit","image":"https://example.com/input.png","response_format":"b64_json"
+	}`))
+	b64Request.Header.Set("Content-Type", "application/json")
+	b64Recorder := httptest.NewRecorder()
+	router.ServeHTTP(b64Recorder, b64Request)
+	if b64Recorder.Code != http.StatusOK || !strings.Contains(b64Recorder.Body.String(), `"b64_json":"aW1hZ2U="`) || len(images.editInputs) != 2 || images.editInputs[1].AutoRouted || images.editInputs[1].EffectiveModel != "grok-imagine-image-edit" {
+		t.Fatalf("b64 edit status=%d inputs=%#v body=%s", b64Recorder.Code, images.editInputs, b64Recorder.Body.String())
+	}
+
+	missingReferences := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"model":"grok-imagine-image-edit","prompt":"edit"
+	}`))
+	missingReferences.Header.Set("Content-Type", "application/json")
+	missingRecorder := httptest.NewRecorder()
+	router.ServeHTTP(missingRecorder, missingReferences)
+	if missingRecorder.Code != http.StatusBadRequest || !strings.Contains(missingRecorder.Body.String(), "需要至少一张参考图") {
+		t.Fatalf("missing references status=%d body=%s", missingRecorder.Code, missingRecorder.Body.String())
+	}
+}
+
+func TestParseImageReferencesSupportsAllShapesAndStableDeduplication(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    []string
+	}{
+		{name: "image string", payload: `{"image":"https://example.com/a.png"}`, want: []string{"https://example.com/a.png"}},
+		{name: "image object", payload: `{"image":{"url":"https://example.com/a.png"}}`, want: []string{"https://example.com/a.png"}},
+		{name: "mixed images", payload: `{"images":["https://example.com/a.png",{"url":"https://example.com/b.png"}]}`, want: []string{"https://example.com/a.png", "https://example.com/b.png"}},
+		{
+			name: "field appearance order and deduplication",
+			payload: `{
+				"image_urls":["https://example.com/c.png","https://example.com/a.png"],
+				"images":[{"url":"https://example.com/b.png"},"https://example.com/c.png"],
+				"image":"https://example.com/a.png"
+			}`,
+			want: []string{"https://example.com/c.png", "https://example.com/a.png", "https://example.com/b.png"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseImageReferences([]byte(test.payload))
+			if err != nil || !slices.Equal(got, test.want) {
+				t.Fatalf("references=%#v error=%#v want=%#v", got, err, test.want)
+			}
+		})
+	}
+
+	if _, err := parseImageReferences([]byte(`{"image":{"file_id":"file_123"}}`)); err == nil || err.Code != "unsupported_parameter" {
+		t.Fatalf("file_id error = %#v", err)
+	}
+}
+
+func TestImageEditRouteAndUnavailableErrorRemainCompatible(t *testing.T) {
+	images := &recordingImageGateway{}
+	router := imageHandlerTestRouter(images)
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
+		"model":"grok-imagine-image","prompt":"edit","image":"https://example.com/a.png"
+	}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || len(images.editInputs) != 1 || images.editInputs[0].PublicModel != "grok-imagine-image-edit" || images.editInputs[0].RequestedModel != "grok-imagine-image" || images.editInputs[0].EffectiveModel != "grok-imagine-image-edit" || !images.editInputs[0].AutoRouted {
+		t.Fatalf("explicit edit status=%d inputs=%#v body=%s", recorder.Code, images.editInputs, recorder.Body.String())
+	}
+	explicitRequest := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{
+		"model":"grok-imagine-image-edit","prompt":"edit","image":{"url":"https://example.com/b.png"}
+	}`))
+	explicitRequest.Header.Set("Content-Type", "application/json")
+	explicitRecorder := httptest.NewRecorder()
+	router.ServeHTTP(explicitRecorder, explicitRequest)
+	if explicitRecorder.Code != http.StatusOK || len(images.editInputs) != 2 || images.editInputs[1].PublicModel != "grok-imagine-image-edit" || images.editInputs[1].RequestedModel != "grok-imagine-image-edit" || images.editInputs[1].EffectiveModel != "grok-imagine-image-edit" || images.editInputs[1].AutoRouted {
+		t.Fatalf("explicit edit model status=%d inputs=%#v body=%s", explicitRecorder.Code, images.editInputs, explicitRecorder.Body.String())
+	}
+
+	images.editErr = errors.New("missing image edit route")
+	unavailable := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{
+		"model":"grok-imagine-image","prompt":"edit","image":{"url":"https://example.com/a.png"}
+	}`))
+	unavailable.Header.Set("Content-Type", "application/json")
+	unavailableRecorder := httptest.NewRecorder()
+	router.ServeHTTP(unavailableRecorder, unavailable)
+	if unavailableRecorder.Code != http.StatusBadGateway || !strings.Contains(unavailableRecorder.Body.String(), "upstream_unavailable") || len(images.generationInputs) != 0 {
+		t.Fatalf("unavailable status=%d body=%s", unavailableRecorder.Code, unavailableRecorder.Body.String())
 	}
 }
 

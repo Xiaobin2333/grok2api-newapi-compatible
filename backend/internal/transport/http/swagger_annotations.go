@@ -33,35 +33,43 @@ type SwaggerMessagesRequest struct {
 
 // SwaggerImageGenerationRequest 表示图片生成请求。
 type SwaggerImageGenerationRequest struct {
-	Model          string `json:"model" example:"grok-imagine-image-quality"`
-	Prompt         string `json:"prompt" example:"A cinematic city at night"`
-	N              int    `json:"n" example:"1"`
-	Size           string `json:"size,omitempty" example:"1024x1024"`
-	Quality        string `json:"quality,omitempty" example:"high"`
-	AspectRatio    string `json:"aspect_ratio,omitempty" example:"16:9"`
-	Resolution     string `json:"resolution,omitempty" example:"2k"`
-	ResponseFormat string `json:"response_format,omitempty" example:"url"`
-	Stream         bool   `json:"stream,omitempty" example:"false"`
-	PartialImages  int    `json:"partial_images,omitempty" example:"0"`
-}
-
-// SwaggerImageReference 表示图片 URL 输入。
-type SwaggerImageReference struct {
-	URL string `json:"url" example:"https://example.com/source.png"`
+	Model  string `json:"model" example:"grok-imagine-image"`
+	Prompt string `json:"prompt" example:"Place image 1 in the setting from image 2"`
+	// Image 接受 URL 字符串或包含 url 的对象。
+	Image any `json:"image,omitempty"`
+	// Images 接受 URL 字符串和包含 url 的对象组成的混合数组。
+	Images []any `json:"images,omitempty"`
+	// ImageURLs 接受 URL 字符串数组。
+	ImageURLs      []string       `json:"image_urls,omitempty" example:"https://example.com/character.png,https://example.com/scene.png"`
+	N              int            `json:"n" example:"1"`
+	Size           string         `json:"size,omitempty" example:"1536x1024"`
+	Quality        string         `json:"quality,omitempty" example:"high"`
+	AspectRatio    string         `json:"aspect_ratio,omitempty" example:"16:9"`
+	Resolution     string         `json:"resolution,omitempty" example:"2k"`
+	ResponseFormat string         `json:"response_format,omitempty" example:"url"`
+	Stream         bool           `json:"stream,omitempty" example:"false"`
+	PartialImages  int            `json:"partial_images,omitempty" example:"0"`
+	StorageOptions map[string]any `json:"storage_options,omitempty"`
 }
 
 // SwaggerImageEditRequest 表示图片编辑请求。
 type SwaggerImageEditRequest struct {
-	Model          string                `json:"model" example:"grok-imagine-image-edit"`
-	Prompt         string                `json:"prompt" example:"Change the background to black"`
-	Image          SwaggerImageReference `json:"image"`
-	N              int                   `json:"n" example:"1"`
-	Size           string                `json:"size,omitempty" example:"1024x1024"`
-	AspectRatio    string                `json:"aspect_ratio,omitempty" example:"1:1"`
-	Resolution     string                `json:"resolution,omitempty" example:"1k"`
-	ResponseFormat string                `json:"response_format,omitempty" example:"url"`
-	Stream         bool                  `json:"stream,omitempty" example:"false"`
-	PartialImages  int                   `json:"partial_images,omitempty" example:"0"`
+	Model  string `json:"model" example:"grok-imagine-image"`
+	Prompt string `json:"prompt" example:"Change the background to black"`
+	// Image 接受 URL 字符串或包含 url 的对象。
+	Image any `json:"image,omitempty"`
+	// Images 接受 URL 字符串和包含 url 的对象组成的混合数组。
+	Images []any `json:"images,omitempty"`
+	// ImageURLs 接受 URL 字符串数组。
+	ImageURLs      []string       `json:"image_urls,omitempty" example:"https://example.com/source.png"`
+	N              int            `json:"n" example:"1"`
+	Size           string         `json:"size,omitempty" example:"1024x1024"`
+	AspectRatio    string         `json:"aspect_ratio,omitempty" example:"1:1"`
+	Resolution     string         `json:"resolution,omitempty" example:"1k"`
+	ResponseFormat string         `json:"response_format,omitempty" example:"url"`
+	Stream         bool           `json:"stream,omitempty" example:"false"`
+	PartialImages  int            `json:"partial_images,omitempty" example:"0"`
+	StorageOptions map[string]any `json:"storage_options,omitempty"`
 }
 
 // SwaggerVideoGenerationRequest 表示视频生成请求。
@@ -184,6 +192,9 @@ func swaggerMessages() {}
 
 // swaggerGenerateImage godoc
 // @Summary 生成图片
+// @Description grok-imagine-image 在没有参考图时执行图片生成；提供 image、images 或 image_urls 后自动按 grok-imagine-image-edit 执行图片编辑。grok-imagine-image-edit 必须提供至少一张参考图。
+// @Description image 接受 URL 字符串或 {"url":"..."} 对象；images 接受二者混合数组；image_urls 接受 URL 字符串数组。多字段按请求中出现顺序合并、去重。
+// @Description 自动路由不改变 OpenAI Images 响应格式，url、b64_json 与扩展 SSE 流均保持兼容。
 // @Tags Images
 // @Security BearerAuth
 // @Accept json
@@ -196,6 +207,8 @@ func swaggerGenerateImage() {}
 
 // swaggerEditImage godoc
 // @Summary 编辑图片
+// @Description 接受 grok-imagine-image 或 grok-imagine-image-edit；前者会在渠道选择、计费和审计前规范为 grok-imagine-image-edit。请求必须提供至少一张参考图。
+// @Description image 接受 URL 字符串或 {"url":"..."} 对象；images 接受二者混合数组；image_urls 接受 URL 字符串数组。多字段按请求中出现顺序合并、去重。
 // @Tags Images
 // @Security BearerAuth
 // @Accept json

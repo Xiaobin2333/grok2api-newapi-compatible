@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,9 @@ type ImageGenerationInput struct {
 	RequestID      string
 	ClientKey      clientkey.Key
 	PublicModel    string
+	RequestedModel string
+	EffectiveModel string
+	AutoRouted     bool
 	Prompt         string
 	Count          int
 	Size           string
@@ -35,6 +39,9 @@ type ImageEditInput struct {
 	RequestID      string
 	ClientKey      clientkey.Key
 	PublicModel    string
+	RequestedModel string
+	EffectiveModel string
+	AutoRouted     bool
 	Prompt         string
 	ImageURLs      []string
 	Count          int
@@ -52,7 +59,8 @@ type imageExecution func(context.Context, accountdomain.Provider, accountdomain.
 
 // GenerateImage 选择支持图片生成的路由和账号，并返回可统一审计的上游响应。
 func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput) (*Result, error) {
-	return s.executeImage(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationImage, modeldomain.CapabilityImage, func(providerValue accountdomain.Provider) bool {
+	requestedModel, effectiveModel := normalizedImageModels(input.PublicModel, input.RequestedModel, input.EffectiveModel)
+	return s.executeImage(ctx, input.RequestID, input.ClientKey, requestedModel, effectiveModel, input.AutoRouted, audit.OperationImage, modeldomain.CapabilityImage, func(providerValue accountdomain.Provider) bool {
 		_, ok := s.providers.ImageGeneration(providerValue)
 		return ok
 	}, func(executionCtx context.Context, providerValue accountdomain.Provider, credential accountdomain.Credential, upstream string) (*provider.Response, error) {
@@ -70,7 +78,8 @@ func (s *Service) GenerateImage(ctx context.Context, input ImageGenerationInput)
 
 // EditImage 选择支持图片编辑的路由和账号，并返回可统一审计的上游响应。
 func (s *Service) EditImage(ctx context.Context, input ImageEditInput) (*Result, error) {
-	return s.executeImage(ctx, input.RequestID, input.ClientKey, input.PublicModel, audit.OperationImageEdit, modeldomain.CapabilityImageEdit, func(providerValue accountdomain.Provider) bool {
+	requestedModel, effectiveModel := normalizedImageModels(input.PublicModel, input.RequestedModel, input.EffectiveModel)
+	return s.executeImage(ctx, input.RequestID, input.ClientKey, requestedModel, effectiveModel, input.AutoRouted, audit.OperationImageEdit, modeldomain.CapabilityImageEdit, func(providerValue accountdomain.Provider) bool {
 		_, ok := s.providers.ImageEdit(providerValue)
 		return ok
 	}, func(executionCtx context.Context, providerValue accountdomain.Provider, credential accountdomain.Credential, upstream string) (*provider.Response, error) {
@@ -91,7 +100,9 @@ func (s *Service) executeImage(
 	ctx context.Context,
 	requestID string,
 	key clientkey.Key,
-	publicModel string,
+	requestedModel string,
+	effectiveModel string,
+	autoRouted bool,
 	operation audit.Operation,
 	capability modeldomain.Capability,
 	supports imageProviderSupport,
@@ -104,7 +115,7 @@ func (s *Service) executeImage(
 	ctx, egressTrace := infraegress.WithTrace(ctx)
 	startedAt := time.Now()
 	eventID := newAuditEventID()
-	routes, err := s.models.GetByPublicIDCandidates(ctx, publicModel)
+	routes, err := s.models.GetByPublicIDCandidates(ctx, effectiveModel)
 	if err != nil {
 		return nil, ErrModelNotFound
 	}
@@ -116,7 +127,11 @@ func (s *Service) executeImage(
 	auditBase := audit.Record{
 		EventID: eventID, RequestID: requestID, ClientKeyID: key.ID, ClientKeyName: key.Name,
 		ModelRouteID: route.ID, ModelPublicID: externalModel, ModelUpstreamModel: modeldomain.DisplayUpstreamModel(route.Provider, route.UpstreamModel),
+		RequestedModel: requestedModel, EffectiveModel: effectiveModel, AutoRouted: autoRouted,
 		Provider: string(route.Provider), Operation: operation, UsageSource: audit.UsageSourceNone, Streaming: streaming,
+	}
+	if autoRouted {
+		s.logger.Info("image_route_normalized", "request_id", requestID, "requested_model", requestedModel, "effective_model", effectiveModel, "auto_routed", true)
 	}
 	if operation == audit.OperationImageEdit {
 		auditBase.MediaInputImages = int64(max(0, inputImageCount))
@@ -297,4 +312,20 @@ func (s *Service) executeImage(
 	}
 	finalizationOwnsReservation = true
 	return &Result{StatusCode: response.StatusCode, Status: response.Status, Header: response.Header, Body: &finalizingBody{ReadCloser: response.Body, finalize: func() { finalize(Usage{}, "", "stream_closed") }}, Finalize: finalize}, nil
+}
+
+func normalizedImageModels(publicModel, requestedModel, effectiveModel string) (string, string) {
+	requestedModel = strings.TrimSpace(requestedModel)
+	effectiveModel = strings.TrimSpace(effectiveModel)
+	publicModel = strings.TrimSpace(publicModel)
+	if requestedModel == "" {
+		requestedModel = publicModel
+	}
+	if effectiveModel == "" {
+		effectiveModel = publicModel
+	}
+	if effectiveModel == "" {
+		effectiveModel = requestedModel
+	}
+	return requestedModel, effectiveModel
 }

@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -696,6 +699,93 @@ func TestImageEditAspectRatioSupportsOpenAISize(t *testing.T) {
 			t.Fatalf("aspect=%q size=%q got=%q err=%v", test.aspectRatio, test.size, got, err)
 		}
 	}
+}
+
+func TestReorderLocalImageReferencesForLandscapeOutput(t *testing.T) {
+	urls := []string{
+		"https://api.example/v1/media/images/role",
+		"https://api.example/v1/media/images/scene",
+	}
+	images := []provider.ImageInput{
+		{Filename: "role.png", MIMEType: "image/png", Data: testPNG(t, 600, 900)},
+		{Filename: "scene.png", MIMEType: "image/png", Data: testPNG(t, 1200, 675)},
+	}
+	prompt := "保持图片1的角色和图片2的场景；IMAGE 1 defines the role, image 2 defines the scene"
+
+	gotURLs, gotImages, gotPrompt := reorderLocalImageReferences(urls, images, prompt, "16:9")
+	if !slices.Equal(gotURLs, []string{urls[1], urls[0]}) || gotImages[0].Filename != "scene.png" || gotImages[1].Filename != "role.png" {
+		t.Fatalf("urls=%#v images=%q,%q", gotURLs, gotImages[0].Filename, gotImages[1].Filename)
+	}
+	wantPrompt := "保持图片2的角色和图片1的场景；IMAGE 2 defines the role, image 1 defines the scene"
+	if gotPrompt != wantPrompt {
+		t.Fatalf("prompt=%q want=%q", gotPrompt, wantPrompt)
+	}
+}
+
+func TestReorderLocalImageReferencesForPortraitOutput(t *testing.T) {
+	urls := []string{
+		"https://api.example/base/v1/media/images/role",
+		"https://api.example/base/v1/media/images/scene",
+		"https://external.example/style.png",
+	}
+	images := []provider.ImageInput{
+		{Filename: "role.png", MIMEType: "image/png", Data: testPNG(t, 1200, 675)},
+		{Filename: "scene.png", MIMEType: "image/png", Data: testPNG(t, 600, 1067)},
+		{Filename: "style.png", MIMEType: "image/png", Data: testPNG(t, 600, 1067)},
+	}
+	prompt := "image 1 是角色，图片2是场景，图片3是画风"
+
+	gotURLs, gotImages, gotPrompt := reorderLocalImageReferences(urls, images, prompt, "9:16")
+	if !slices.Equal(gotURLs, []string{urls[1], urls[0], urls[2]}) || gotImages[0].Filename != "scene.png" {
+		t.Fatalf("urls=%#v images=%#v", gotURLs, gotImages)
+	}
+	if gotPrompt != "image 2 是角色，图片1是场景，图片3是画风" {
+		t.Fatalf("prompt=%q", gotPrompt)
+	}
+}
+
+func TestReorderLocalImageReferencesKeepsOrderWithoutDimensions(t *testing.T) {
+	urls := []string{
+		"https://external.example/role.png",
+		"https://api.example/v1/media/images/broken",
+	}
+	images := []provider.ImageInput{
+		{Filename: "role.png", MIMEType: "image/png", Data: testPNG(t, 1600, 900)},
+		{Filename: "broken.png", MIMEType: "image/png", Data: []byte("not an image")},
+	}
+	prompt := "图片1是角色，image 2 is style"
+
+	gotURLs, gotImages, gotPrompt := reorderLocalImageReferences(urls, images, prompt, "16:9")
+	if !slices.Equal(gotURLs, urls) || gotImages[0].Filename != "role.png" || gotPrompt != prompt {
+		t.Fatalf("urls=%#v images=%#v prompt=%q", gotURLs, gotImages, gotPrompt)
+	}
+}
+
+func TestReferenceImageDimensionsSupportsWebP(t *testing.T) {
+	data := make([]byte, 30)
+	copy(data[:4], "RIFF")
+	copy(data[8:12], "WEBP")
+	copy(data[12:16], "VP8X")
+	data[16] = 10
+	width, height := 1600, 900
+	data[24], data[25], data[26] = byte(width-1), byte((width-1)>>8), byte((width-1)>>16)
+	data[27], data[28], data[29] = byte(height-1), byte((height-1)>>8), byte((height-1)>>16)
+
+	gotWidth, gotHeight, ok := referenceImageDimensions(provider.ImageInput{MIMEType: "image/webp", Data: data})
+	if !ok || gotWidth != width || gotHeight != height {
+		t.Fatalf("dimensions=%dx%d ok=%t", gotWidth, gotHeight, ok)
+	}
+}
+
+func testPNG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	value := image.NewNRGBA(image.Rect(0, 0, width, height))
+	value.Set(0, 0, color.NRGBA{R: 255, A: 255})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, value); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
 }
 
 func TestParseImageEditStreamFrame(t *testing.T) {

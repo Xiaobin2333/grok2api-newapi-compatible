@@ -33,6 +33,7 @@ func TestAuditDetailReturnsCompleteTextAndBinaryBodies(t *testing.T) {
 	status := http.StatusBadGateway
 	if err := repository.Create(ctx, auditdomain.Record{
 		EventID: "evt_audit_handler_0001", RequestID: "request-detail", ClientKeyID: 1, ModelRouteID: 1, StatusCode: status, CreatedAt: now,
+		RequestedModel: "grok-imagine-image", EffectiveModel: "grok-imagine-image-edit", AutoRouted: true,
 		Attempts: []auditdomain.Attempt{
 			{Number: 1, Source: auditdomain.AttemptSourceUpstreamHTTP, Stage: "upstream_response", StartedAt: now, UpstreamStatusCode: &status, ResponseHeaders: http.Header{"Content-Type": {"application/json"}}, ResponseBody: []byte(`{"error":"complete"}`), ResponseBodyTruncated: true},
 			{Number: 2, Source: auditdomain.AttemptSourceUpstreamHTTP, Stage: "upstream_response", StartedAt: now, UpstreamStatusCode: &status, ResponseHeaders: http.Header{}, ResponseBody: []byte{0x00, 0xff, 0x01}},
@@ -52,7 +53,10 @@ func TestAuditDetailReturnsCompleteTextAndBinaryBodies(t *testing.T) {
 	var payload struct {
 		Data struct {
 			Audit struct {
-				AttemptCount int `json:"attemptCount"`
+				AttemptCount   int    `json:"attemptCount"`
+				RequestedModel string `json:"requestedModel"`
+				EffectiveModel string `json:"effectiveModel"`
+				AutoRouted     bool   `json:"autoRouted"`
 			} `json:"audit"`
 			Attempts []struct {
 				ResponseBody          string `json:"responseBody"`
@@ -66,6 +70,9 @@ func TestAuditDetailReturnsCompleteTextAndBinaryBodies(t *testing.T) {
 	}
 	if payload.Data.Audit.AttemptCount != 2 || len(payload.Data.Attempts) != 2 {
 		t.Fatalf("payload = %#v", payload)
+	}
+	if payload.Data.Audit.RequestedModel != "grok-imagine-image" || payload.Data.Audit.EffectiveModel != "grok-imagine-image-edit" || !payload.Data.Audit.AutoRouted {
+		t.Fatalf("route audit = %#v", payload.Data.Audit)
 	}
 	if payload.Data.Attempts[0].ResponseBodyEncoding != "utf8" || payload.Data.Attempts[0].ResponseBody != `{"error":"complete"}` || !payload.Data.Attempts[0].ResponseBodyTruncated {
 		t.Fatalf("text body = %#v", payload.Data.Attempts[0])

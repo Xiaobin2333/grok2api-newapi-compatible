@@ -33,6 +33,9 @@ type auditResponse struct {
 	ModelRouteID            uint64    `json:"modelRouteId,string"`
 	ModelPublicID           string    `json:"modelPublicId,omitempty"`
 	ModelUpstreamModel      string    `json:"modelUpstreamModel,omitempty"`
+	RequestedModel          string    `json:"requestedModel,omitempty"`
+	EffectiveModel          string    `json:"effectiveModel,omitempty"`
+	AutoRouted              bool      `json:"autoRouted"`
 	Provider                string    `json:"provider"`
 	Operation               string    `json:"operation"`
 	UsageSource             string    `json:"usageSource"`
@@ -267,6 +270,7 @@ func newAuditResponse(value auditdomain.Record) auditResponse {
 	return auditResponse{
 		ID: value.ID, RequestID: value.RequestID, ClientKeyID: value.ClientKeyID, ClientKeyName: value.ClientKeyName,
 		ModelRouteID: value.ModelRouteID, ModelPublicID: value.ModelPublicID, ModelUpstreamModel: value.ModelUpstreamModel,
+		RequestedModel: value.RequestedModel, EffectiveModel: value.EffectiveModel, AutoRouted: value.AutoRouted,
 		Provider: value.Provider, Operation: string(value.Operation), UsageSource: string(value.UsageSource),
 		AccountID: value.AccountID, AccountName: value.AccountName,
 		EgressNodeID: value.EgressNodeID, EgressNodeName: value.EgressNodeName, EgressScope: value.EgressScope, EgressMode: string(value.EgressMode),

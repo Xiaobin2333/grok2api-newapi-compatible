@@ -2,6 +2,7 @@ package inference
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,10 +28,16 @@ import (
 
 type Handler struct {
 	gateway          *gateway.Service
+	images           imageGateway
 	models           *modelapp.Service
 	maxBodyBytes     int64
 	publicAPIBaseURL string
 	publicBaseURL    func() string
+}
+
+type imageGateway interface {
+	GenerateImage(context.Context, gateway.ImageGenerationInput) (*gateway.Result, error)
+	EditImage(context.Context, gateway.ImageEditInput) (*gateway.Result, error)
 }
 
 const (
@@ -70,7 +77,11 @@ func NewHandler(gatewayService *gateway.Service, models *modelapp.Service, maxBo
 	if len(publicAPIBaseURL) > 0 {
 		baseURL = strings.TrimRight(strings.TrimSpace(publicAPIBaseURL[0]), "/")
 	}
-	return &Handler{gateway: gatewayService, models: models, maxBodyBytes: maxBodyBytes, publicAPIBaseURL: baseURL}
+	var images imageGateway
+	if gatewayService != nil {
+		images = gatewayService
+	}
+	return &Handler{gateway: gatewayService, images: images, models: models, maxBodyBytes: maxBodyBytes, publicAPIBaseURL: baseURL}
 }
 
 // SetPublicAPIBaseURLResolver 让视频内容 URL 跟随运行设置热更新。
@@ -137,18 +148,16 @@ type imageEditJSONImage struct {
 }
 
 type imageEditJSONRequest struct {
-	Model          string               `json:"model"`
-	Prompt         string               `json:"prompt"`
-	Image          *imageEditJSONImage  `json:"image"`
-	Images         []imageEditJSONImage `json:"images"`
-	Count          *int                 `json:"n"`
-	Size           string               `json:"size"`
-	AspectRatio    string               `json:"aspect_ratio"`
-	Resolution     string               `json:"resolution"`
-	ResponseFormat string               `json:"response_format"`
-	StorageOptions json.RawMessage      `json:"storage_options"`
-	Stream         bool                 `json:"stream"`
-	PartialImages  *int                 `json:"partial_images"`
+	Model          string          `json:"model"`
+	Prompt         string          `json:"prompt"`
+	Count          *int            `json:"n"`
+	Size           string          `json:"size"`
+	AspectRatio    string          `json:"aspect_ratio"`
+	Resolution     string          `json:"resolution"`
+	ResponseFormat string          `json:"response_format"`
+	StorageOptions json.RawMessage `json:"storage_options"`
+	Stream         bool            `json:"stream"`
+	PartialImages  *int            `json:"partial_images"`
 }
 
 type videoGenerationImage struct {
@@ -315,8 +324,19 @@ func (h *Handler) generateImage(c *gin.Context) {
 		return
 	}
 	var request imageGenerationRequest
-	if decodeSingleJSON(c.Request.Body, &request, false) != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
+	payload, decodeErr := decodeImageJSONRequest(c.Request.Body, &request)
+	if decodeErr != nil || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.Prompt) == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片请求缺少有效 model 或 prompt")
+		return
+	}
+	imageURLs, referenceErr := parseImageReferences(payload)
+	if referenceErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, referenceErr.Code, referenceErr.Message)
+		return
+	}
+	route, routeErr := normalizeGrokImageRoute(grokImageGenerationsEndpoint, request.Model, imageURLs)
+	if routeErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, routeErr.Code, routeErr.Message)
 		return
 	}
 	if value := bytes.TrimSpace(request.StorageOptions); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
@@ -335,6 +355,30 @@ func (h *Handler) generateImage(c *gin.Context) {
 			return
 		}
 		count = *request.Count
+	}
+	if route.Capability == modeldomain.CapabilityImageEdit {
+		options, validationErr := resolveImageEditOptions(request.Count, request.Size, request.AspectRatio, resolution, request.Stream, request.PartialImages)
+		if validationErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, validationErr.Code, validationErr.Message)
+			return
+		}
+		clientKey, requestID, ok := requestIdentity(c)
+		if !ok {
+			return
+		}
+		result, err := h.images.EditImage(c.Request.Context(), gateway.ImageEditInput{
+			RequestID: requestID, ClientKey: clientKey, PublicModel: route.EffectiveModel, Prompt: strings.TrimSpace(request.Prompt),
+			RequestedModel: route.RequestedModel, EffectiveModel: route.EffectiveModel, AutoRouted: route.AutoRouted,
+			ImageURLs: imageURLs, Count: options.Count, Size: options.Size, AspectRatio: options.AspectRatio,
+			Resolution: options.Resolution, ResponseFormat: request.ResponseFormat,
+			Streaming: request.Stream, PartialImages: options.PartialImages,
+		})
+		if err != nil {
+			writeGatewayError(c, err)
+			return
+		}
+		h.writeResult(c, result, request.Stream, streamProtocolImage)
+		return
 	}
 	if request.Stream && count != 1 {
 		writeImageGenerationUserError(c, "unsupported_parameter", "input", "Streaming is only supported with n=1.")
@@ -356,8 +400,9 @@ func (h *Handler) generateImage(c *gin.Context) {
 	if !ok {
 		return
 	}
-	result, err := h.gateway.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
-		RequestID: requestID, ClientKey: clientKey, PublicModel: request.Model, Prompt: request.Prompt,
+	result, err := h.images.GenerateImage(c.Request.Context(), gateway.ImageGenerationInput{
+		RequestID: requestID, ClientKey: clientKey, PublicModel: route.EffectiveModel, Prompt: request.Prompt,
+		RequestedModel: route.RequestedModel, EffectiveModel: route.EffectiveModel, AutoRouted: route.AutoRouted,
 		Count: count, Size: request.Size, AspectRatio: request.AspectRatio,
 		Resolution: resolution, ResponseFormat: request.ResponseFormat,
 		Streaming: request.Stream, PartialImages: partialImages,
@@ -367,6 +412,191 @@ func (h *Handler) generateImage(c *gin.Context) {
 		return
 	}
 	h.writeResult(c, result, request.Stream, streamProtocolImage)
+}
+
+type imageRequestError struct {
+	Code    string
+	Message string
+}
+
+type imageEditOptions struct {
+	Count         int
+	Size          string
+	AspectRatio   string
+	Resolution    string
+	PartialImages int
+}
+
+type grokImageEndpoint uint8
+
+const (
+	grokImageGenerationsEndpoint grokImageEndpoint = iota
+	grokImageEditsEndpoint
+	grokImageGenerationModel = "grok-imagine-image"
+	grokImageEditModel       = "grok-imagine-image-edit"
+)
+
+type grokImageRoute struct {
+	RequestedModel string
+	EffectiveModel string
+	Capability     modeldomain.Capability
+	HasReferences  bool
+	AutoRouted     bool
+}
+
+func normalizeGrokImageRoute(endpoint grokImageEndpoint, requestedModel string, referenceImages []string) (grokImageRoute, *imageRequestError) {
+	requestedModel = strings.TrimSpace(requestedModel)
+	route := grokImageRoute{
+		RequestedModel: requestedModel,
+		EffectiveModel: requestedModel,
+		HasReferences:  len(referenceImages) > 0,
+	}
+	if endpoint == grokImageEditsEndpoint || route.HasReferences {
+		route.Capability = modeldomain.CapabilityImageEdit
+		if requestedModel == grokImageGenerationModel {
+			route.EffectiveModel = grokImageEditModel
+			route.AutoRouted = true
+		}
+		return route, nil
+	}
+	route.Capability = modeldomain.CapabilityImage
+	if requestedModel == grokImageEditModel {
+		return grokImageRoute{}, &imageRequestError{Code: "invalid_request", Message: "grok-imagine-image-edit 需要至少一张参考图"}
+	}
+	return route, nil
+}
+
+func decodeImageJSONRequest(body io.Reader, destination any) ([]byte, error) {
+	payload, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	if err := decodeSingleJSON(bytes.NewReader(payload), destination, false); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func parseImageReferences(payload []byte) ([]string, *imageRequestError) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, &imageRequestError{Code: "invalid_request", Message: "图片请求 JSON 无效"}
+	}
+	values := make([]string, 0, 8)
+	seen := make(map[string]struct{}, 8)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, &imageRequestError{Code: "invalid_request", Message: "图片请求 JSON 无效"}
+		}
+		key, _ := keyToken.(string)
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return nil, &imageRequestError{Code: "invalid_request", Message: "图片请求 JSON 无效"}
+		}
+		if key != "image" && key != "images" && key != "image_urls" {
+			continue
+		}
+		fieldValues, parseErr := parseImageReferenceField(raw, key != "image")
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		for _, value := range fieldValues {
+			if _, exists := seen[value]; exists {
+				continue
+			}
+			seen[value] = struct{}{}
+			values = append(values, value)
+		}
+	}
+	if len(values) > 8 {
+		return nil, &imageRequestError{Code: "invalid_request", Message: "image、images 和 image_urls 去重后数量必须在 1 到 8 之间"}
+	}
+	return values, nil
+}
+
+func parseImageReferenceField(raw json.RawMessage, plural bool) ([]string, *imageRequestError) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, nil
+	}
+	if !plural {
+		value, err := parseImageReferenceValue(raw)
+		if err != nil {
+			return nil, err
+		}
+		return []string{value}, nil
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil, &imageRequestError{Code: "invalid_request", Message: "images 和 image_urls 必须是参考图数组"}
+	}
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		value, err := parseImageReferenceValue(item)
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func parseImageReferenceValue(raw json.RawMessage) (string, *imageRequestError) {
+	var urlValue string
+	if json.Unmarshal(raw, &urlValue) != nil {
+		var value imageEditJSONImage
+		if json.Unmarshal(raw, &value) != nil {
+			return "", &imageRequestError{Code: "invalid_request", Message: "参考图必须是 URL 字符串或包含 url 的对象"}
+		}
+		if strings.TrimSpace(value.FileID) != "" {
+			return "", &imageRequestError{Code: "unsupported_parameter", Message: "当前暂不支持 image.file_id，请使用 image.url"}
+		}
+		urlValue = value.URL
+	}
+	urlValue = strings.TrimSpace(urlValue)
+	if urlValue == "" {
+		return "", &imageRequestError{Code: "invalid_request", Message: "每个参考图都必须提供有效 url"}
+	}
+	return urlValue, nil
+}
+
+func resolveImageEditOptions(countValue *int, sizeValue, aspectRatioValue, resolutionValue string, stream bool, partialImagesValue *int) (imageEditOptions, *imageRequestError) {
+	options := imageEditOptions{
+		Count:       1,
+		Size:        strings.ToLower(strings.TrimSpace(sizeValue)),
+		AspectRatio: strings.ToLower(strings.TrimSpace(aspectRatioValue)),
+		Resolution:  strings.ToLower(strings.TrimSpace(resolutionValue)),
+	}
+	if countValue != nil {
+		options.Count = *countValue
+	}
+	if options.Count != 1 {
+		return imageEditOptions{}, &imageRequestError{Code: "invalid_parameter", Message: "Grok Web 图片编辑当前仅支持 n=1"}
+	}
+	if partialImagesValue != nil {
+		options.PartialImages = *partialImagesValue
+		if options.PartialImages < 0 || options.PartialImages > 3 {
+			return imageEditOptions{}, &imageRequestError{Code: "invalid_parameter", Message: "partial_images 必须在 0 到 3 之间"}
+		}
+		if options.PartialImages > 0 && !stream {
+			return imageEditOptions{}, &imageRequestError{Code: "invalid_parameter", Message: "partial_images 仅可在 stream=true 时使用"}
+		}
+	}
+	if options.AspectRatio != "" && !validImageAspectRatio(options.AspectRatio) {
+		return imageEditOptions{}, &imageRequestError{Code: "invalid_parameter", Message: "aspect_ratio 不受支持"}
+	}
+	if options.Size != "" && !validImageEditSize(options.Size) {
+		return imageEditOptions{}, &imageRequestError{Code: "invalid_parameter", Message: "size 必须是 auto、1024x1024、1024x1536 或 1536x1024"}
+	}
+	if options.Resolution == "" {
+		options.Resolution = "1k"
+	}
+	if options.Resolution != "1k" {
+		return imageEditOptions{}, &imageRequestError{Code: "invalid_parameter", Message: "Grok Web 图片编辑当前仅支持 resolution=1k"}
+	}
+	return options, nil
 }
 
 func resolveOpenAIImageResolution(resolution, quality string) (string, error) {
@@ -480,8 +710,14 @@ func (h *Handler) editImage(c *gin.Context) {
 		return
 	}
 	var request imageEditJSONRequest
-	if err := decodeSingleJSON(c.Request.Body, &request, false); err != nil {
+	payload, err := decodeImageJSONRequest(c.Request.Body, &request)
+	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 JSON 请求无效")
+		return
+	}
+	imageURLs, referenceErr := parseImageReferences(payload)
+	if referenceErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, referenceErr.Code, referenceErr.Message)
 		return
 	}
 	if value := bytes.TrimSpace(request.StorageOptions); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
@@ -490,79 +726,34 @@ func (h *Handler) editImage(c *gin.Context) {
 	}
 	model := strings.TrimSpace(request.Model)
 	prompt := strings.TrimSpace(request.Prompt)
-	count := 1
-	if request.Count != nil {
-		count = *request.Count
-	}
-	inputs := append([]imageEditJSONImage(nil), request.Images...)
-	if request.Image != nil {
-		inputs = append([]imageEditJSONImage{*request.Image}, inputs...)
-	}
-	if len(inputs) == 0 || len(inputs) > 8 {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 或 images 数量必须在 1 到 8 之间")
+	if len(imageURLs) == 0 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "image 或 images（以及 image_urls）数量必须在 1 到 8 之间")
 		return
 	}
-	imageURLs := make([]string, 0, len(inputs))
-	for _, input := range inputs {
-		if strings.TrimSpace(input.FileID) != "" {
-			writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", "当前暂不支持 image.file_id，请使用 image.url")
-			return
-		}
-		if value := strings.TrimSpace(input.URL); value != "" {
-			imageURLs = append(imageURLs, value)
-		}
-	}
-	if len(imageURLs) != len(inputs) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "每个 image 都必须提供有效 url")
+	route, routeErr := normalizeGrokImageRoute(grokImageEditsEndpoint, model, imageURLs)
+	if routeErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, routeErr.Code, routeErr.Message)
 		return
 	}
 	if model == "" || prompt == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑缺少有效 model 或 prompt")
 		return
 	}
-	if count != 1 {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "Grok Web 图片编辑当前仅支持 n=1")
-		return
-	}
-	partialImages := 0
-	if request.PartialImages != nil {
-		if *request.PartialImages < 0 || *request.PartialImages > 3 {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "partial_images 必须在 0 到 3 之间")
-			return
-		}
-		partialImages = *request.PartialImages
-		if partialImages > 0 && !request.Stream {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "partial_images 仅可在 stream=true 时使用")
-			return
-		}
-	}
-	aspectRatio := strings.ToLower(strings.TrimSpace(request.AspectRatio))
-	size := strings.ToLower(strings.TrimSpace(request.Size))
-	if aspectRatio != "" && !validImageAspectRatio(aspectRatio) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "aspect_ratio 不受支持")
-		return
-	}
-	if size != "" && !validImageEditSize(size) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "size 必须是 auto、1024x1024、1024x1536 或 1536x1024")
-		return
-	}
-	resolution := strings.ToLower(strings.TrimSpace(request.Resolution))
-	if resolution == "" {
-		resolution = "1k"
-	}
-	if resolution != "1k" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_parameter", "Grok Web 图片编辑当前仅支持 resolution=1k")
+	options, validationErr := resolveImageEditOptions(request.Count, request.Size, request.AspectRatio, request.Resolution, request.Stream, request.PartialImages)
+	if validationErr != nil {
+		writeOpenAIError(c, http.StatusBadRequest, validationErr.Code, validationErr.Message)
 		return
 	}
 	clientKey, requestID, ok := requestIdentity(c)
 	if !ok {
 		return
 	}
-	result, err := h.gateway.EditImage(c.Request.Context(), gateway.ImageEditInput{
-		RequestID: requestID, ClientKey: clientKey, PublicModel: model, Prompt: prompt,
-		ImageURLs: imageURLs, Count: count, Size: size, AspectRatio: aspectRatio,
-		Resolution: resolution, ResponseFormat: request.ResponseFormat,
-		Streaming: request.Stream, PartialImages: partialImages,
+	result, err := h.images.EditImage(c.Request.Context(), gateway.ImageEditInput{
+		RequestID: requestID, ClientKey: clientKey, PublicModel: route.EffectiveModel, Prompt: prompt,
+		RequestedModel: route.RequestedModel, EffectiveModel: route.EffectiveModel, AutoRouted: route.AutoRouted,
+		ImageURLs: imageURLs, Count: options.Count, Size: options.Size, AspectRatio: options.AspectRatio,
+		Resolution: options.Resolution, ResponseFormat: request.ResponseFormat,
+		Streaming: request.Stream, PartialImages: options.PartialImages,
 	})
 	if err != nil {
 		writeGatewayError(c, err)
