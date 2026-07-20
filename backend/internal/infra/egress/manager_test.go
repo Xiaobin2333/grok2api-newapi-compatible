@@ -164,6 +164,26 @@ func TestConfiguredCoolingAppNodesNeverFallBackToDirect(t *testing.T) {
 	}
 }
 
+func TestForceNoCooldownNodeRemainsAvailableAfterTransportFailure(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &mutableEgressRepository{node: domain.Node{
+		ID: 1, Name: "always-on", Scope: domain.ScopeWeb, Enabled: true, ForceNoCooldown: true, Health: 1,
+	}}
+	manager := NewManager(repository, cipher)
+	manager.FeedbackForScope(context.Background(), domain.ScopeWeb, 1, 0, errors.New("proxy unavailable"))
+	if repository.node.CooldownUntil != nil || repository.node.FailureCount != 1 || repository.node.LastError != "transport error" {
+		t.Fatalf("force-no-cooldown feedback = %#v", repository.node)
+	}
+	lease, err := manager.Acquire(context.Background(), domain.ScopeWeb, "account")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.Release()
+}
+
 func TestDisabledConfiguredNodesAllowDirectFallback(t *testing.T) {
 	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{{
 		ID: 1, Name: "disabled-proxy", Scope: domain.ScopeBuild, Enabled: false, Health: 1,

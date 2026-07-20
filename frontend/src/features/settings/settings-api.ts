@@ -31,14 +31,14 @@ export type SettingsConfigDTO = {
 };
 
 export type EgressNodeDTO = {
-  id: string; name: string; scope: EgressScope; enabled: boolean;
+  id: string; name: string; scope: EgressScope; enabled: boolean; forceNoCooldown: boolean;
   proxyConfigured: boolean; userAgent: string; cookieConfigured: boolean;
   accountBoundProxy: boolean;
   health: number; failureCount: number; cooldownUntil?: string; lastError?: string;
 };
 
 export type EgressNodeInput = {
-  name: string; scope: EgressScope; enabled: boolean; proxyURL?: string;
+  name: string; scope: EgressScope; enabled: boolean; forceNoCooldown: boolean; proxyURL?: string;
   clearProxyURL?: boolean; userAgent: string; cloudflareCookies?: string; clearCookies?: boolean;
 };
 
@@ -107,12 +107,12 @@ const decodeSettingsSnapshotRaw = createObjectDecoder<SettingsSnapshotDTO>("sett
 });
 const decodeSettingsSnapshot = (value: unknown) => withAccountsDefaults(decodeSettingsSnapshotRaw(value));
 const egressNodeValidator = hasShape({
-  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset"), enabled: isBoolean,
+  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset"), enabled: isBoolean, forceNoCooldown: isBoolean,
   proxyConfigured: isBoolean, userAgent: isString, cookieConfigured: isBoolean, accountBoundProxy: isBoolean, health: isNumber, failureCount: isNumber,
   cooldownUntil: isOptional(isString), lastError: isOptional(isString),
 });
 const decodeEgressNode = createObjectDecoder<EgressNodeDTO>("egress node", {
-  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset"), enabled: isBoolean,
+  id: isString, name: isString, scope: isOneOf("grok_build", "grok_web", "grok_console", "grok_web_asset"), enabled: isBoolean, forceNoCooldown: isBoolean,
   proxyConfigured: isBoolean, userAgent: isString, cookieConfigured: isBoolean, accountBoundProxy: isBoolean, health: isNumber, failureCount: isNumber,
   cooldownUntil: isOptional(isString), lastError: isOptional(isString),
 });

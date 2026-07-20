@@ -213,7 +213,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 				continue
 			}
 			configured = true
-			if node.CooldownUntil == nil || !now.Before(*node.CooldownUntil) {
+			if node.ForceNoCooldown || node.CooldownUntil == nil || !now.Before(*node.CooldownUntil) {
 				candidateAvailable = append(candidateAvailable, node)
 			}
 		}
@@ -583,7 +583,11 @@ func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, node
 		value.Health = max(0.05, value.Health*0.7)
 		cooldown := min(10*time.Minute, 30*time.Second*time.Duration(1<<min(value.FailureCount-1, 4)))
 		until := now.Add(cooldown)
-		value.CooldownUntil = &until
+		if value.ForceNoCooldown {
+			value.CooldownUntil = nil
+		} else {
+			value.CooldownUntil = &until
+		}
 		if transportErr != nil {
 			value.LastError = "transport error"
 		} else {

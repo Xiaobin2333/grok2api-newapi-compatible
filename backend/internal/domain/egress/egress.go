@@ -24,6 +24,7 @@ type Node struct {
 	Name                        string
 	Scope                       Scope
 	Enabled                     bool
+	ForceNoCooldown             bool
 	EncryptedProxyURL           string
 	UserAgent                   string
 	EncryptedCloudflareCookie   string
@@ -43,6 +44,7 @@ type PublicNode struct {
 	Name              string
 	Scope             Scope
 	Enabled           bool
+	ForceNoCooldown   bool
 	ProxyConfigured   bool
 	UserAgent         string
 	CookieConfigured  bool

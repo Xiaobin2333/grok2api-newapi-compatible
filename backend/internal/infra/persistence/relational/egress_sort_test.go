@@ -55,7 +55,7 @@ func TestEgressStateUpdatesDoNotOverwriteClearanceOrHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	repo := NewEgressRepository(database)
-	node, err := repo.CreateEgressNode(ctx, egress.Node{Name: "web", Scope: egress.ScopeWeb, Enabled: true, Health: 1, UserAgent: "old", EncryptedCloudflareCookie: "old-cookie"})
+	node, err := repo.CreateEgressNode(ctx, egress.Node{Name: "web", Scope: egress.ScopeWeb, Enabled: true, ForceNoCooldown: true, Health: 1, UserAgent: "old", EncryptedCloudflareCookie: "old-cookie"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestEgressStateUpdatesDoNotOverwriteClearanceOrHealth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if actual.Health != 0.4 || actual.FailureCount != 2 || actual.EncryptedCloudflareCookie != "new-cookie" || actual.UserAgent != "new-agent" || actual.ClearanceBindingFingerprint != strings.Repeat("b", 64) {
+	if !actual.ForceNoCooldown || actual.Health != 0.4 || actual.FailureCount != 2 || actual.EncryptedCloudflareCookie != "new-cookie" || actual.UserAgent != "new-agent" || actual.ClearanceBindingFingerprint != strings.Repeat("b", 64) {
 		t.Fatalf("partial updates overwrote state: %#v", actual)
 	}
 }
@@ -90,6 +90,9 @@ func TestInitializeSchemaRemovesAndRejectsLegacyAllEgressNodes(t *testing.T) {
 
 	if err := database.InitializeSchema(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if !database.db.Migrator().HasColumn(&egressNodeModel{}, "force_no_cooldown") {
+		t.Fatal("egress force_no_cooldown column was not migrated")
 	}
 	var count int64
 	if err := database.db.WithContext(ctx).Model(&egressNodeModel{}).Where("scope = ?", "all").Count(&count).Error; err != nil {

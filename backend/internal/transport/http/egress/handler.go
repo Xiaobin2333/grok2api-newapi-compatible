@@ -42,6 +42,7 @@ type nodeRequest struct {
 	Name              string  `json:"name"`
 	Scope             string  `json:"scope"`
 	Enabled           bool    `json:"enabled"`
+	ForceNoCooldown   bool    `json:"forceNoCooldown"`
 	ProxyURL          *string `json:"proxyURL"`
 	ClearProxyURL     bool    `json:"clearProxyURL"`
 	UserAgent         string  `json:"userAgent"`
@@ -54,6 +55,7 @@ type nodeResponse struct {
 	Name              string     `json:"name"`
 	Scope             string     `json:"scope"`
 	Enabled           bool       `json:"enabled"`
+	ForceNoCooldown   bool       `json:"forceNoCooldown"`
 	ProxyConfigured   bool       `json:"proxyConfigured"`
 	UserAgent         string     `json:"userAgent"`
 	CookieConfigured  bool       `json:"cookieConfigured"`
@@ -66,7 +68,7 @@ type nodeResponse struct {
 
 func (value nodeRequest) input() egressapp.Input {
 	return egressapp.Input{
-		Name: value.Name, Scope: egressdomain.Scope(value.Scope), Enabled: value.Enabled,
+		Name: value.Name, Scope: egressdomain.Scope(value.Scope), Enabled: value.Enabled, ForceNoCooldown: value.ForceNoCooldown,
 		ProxyURL: value.ProxyURL, ClearProxyURL: value.ClearProxyURL, UserAgent: value.UserAgent,
 		CloudflareCookies: value.CloudflareCookies, ClearCookies: value.ClearCookies,
 	}
@@ -128,7 +130,7 @@ func (h *Handler) update(c *gin.Context) {
 
 func newNodeResponse(value egressdomain.PublicNode) nodeResponse {
 	return nodeResponse{
-		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled,
+		ID: value.ID, Name: value.Name, Scope: string(value.Scope), Enabled: value.Enabled, ForceNoCooldown: value.ForceNoCooldown,
 		ProxyConfigured: value.ProxyConfigured, UserAgent: value.UserAgent, CookieConfigured: value.CookieConfigured,
 		AccountBoundProxy: value.AccountBoundProxy,
 		Health:            value.Health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: value.LastError,

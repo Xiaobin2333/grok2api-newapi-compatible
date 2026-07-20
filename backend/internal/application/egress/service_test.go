@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -119,5 +120,23 @@ func TestPublicNodeReportsAccountBoundProxy(t *testing.T) {
 	}
 	if service.publicNode(domain.Node{Scope: domain.ScopeWeb}).AccountBoundProxy {
 		t.Fatal("direct node was reported as account-bound")
+	}
+}
+
+func TestForceNoCooldownClearsExistingCooldownAndIsPublic(t *testing.T) {
+	service := &Service{}
+	until := time.Now().Add(time.Hour)
+	value, err := service.applyInput(domain.Node{CooldownUntil: &until}, Input{
+		Name: "web", Scope: domain.ScopeWeb, Enabled: true, ForceNoCooldown: true,
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !value.ForceNoCooldown || value.CooldownUntil != nil {
+		t.Fatalf("node = %#v", value)
+	}
+	public := service.publicNode(value)
+	if !public.ForceNoCooldown || public.CooldownUntil != nil {
+		t.Fatalf("public node = %#v", public)
 	}
 }

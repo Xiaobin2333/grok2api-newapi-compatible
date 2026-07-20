@@ -20,7 +20,7 @@ import { SortableTableHead } from "@/shared/components/sortable-table-head";
 import { ErrorState } from "@/shared/components/data-state";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
 
-const emptyInput: EgressNodeInput = { name: "", scope: "grok_build", enabled: true, proxyURL: "", userAgent: "", cloudflareCookies: "" };
+const emptyInput: EgressNodeInput = { name: "", scope: "grok_build", enabled: true, forceNoCooldown: false, proxyURL: "", userAgent: "", cloudflareCookies: "" };
 
 export function EgressNodes({ clearanceMode }: { clearanceMode: "manual" | "flaresolverr" }) {
   const { t } = useTranslation();
@@ -59,7 +59,7 @@ export function EgressNodes({ clearanceMode }: { clearanceMode: "manual" | "flar
   }
 
   function openEdit(node: EgressNodeDTO) {
-    setForm({ name: node.name, scope: node.scope, enabled: node.enabled, userAgent: node.scope === "grok_build" ? "" : node.userAgent, proxyURL: "", cloudflareCookies: "" });
+    setForm({ name: node.name, scope: node.scope, enabled: node.enabled, forceNoCooldown: node.forceNoCooldown, userAgent: node.scope === "grok_build" ? "" : node.userAgent, proxyURL: "", cloudflareCookies: "" });
     setEditing(node);
   }
 
@@ -98,7 +98,7 @@ export function EgressNodes({ clearanceMode }: { clearanceMode: "manual" | "flar
           <TableBody>
             {nodes.length === 0 ? <TableRow><TableCell colSpan={6} className="h-20 text-center text-xs text-muted-foreground">{t("settings.egress.directFallback")}</TableCell></TableRow> : nodes.map((node) => (
               <TableRow className="group" key={node.id}>
-                <TableCell><div className="text-xs font-medium">{node.name}</div>{node.lastError ? <div className="mt-0.5 max-w-72 truncate text-[11px] text-destructive">{node.lastError}</div> : null}</TableCell>
+                <TableCell><div className="flex items-center gap-1.5 text-xs font-medium">{node.name}{node.forceNoCooldown ? <Badge variant="outline" className="text-[9px]">{t("settings.egress.forceNoCooldownShort")}</Badge> : null}</div>{node.lastError ? <div className="mt-0.5 max-w-72 truncate text-[11px] text-destructive">{node.lastError}</div> : null}</TableCell>
                 <TableCell className="text-center"><Badge variant="secondary" className="text-[10px]">{scopeLabel(node.scope)}</Badge></TableCell>
                 <TableCell className="text-center text-xs text-muted-foreground">{node.proxyConfigured ? t("settings.egress.configured") : t("settings.egress.direct")}</TableCell>
                 <TableCell className="text-center text-xs text-muted-foreground">
@@ -135,6 +135,13 @@ export function EgressNodes({ clearanceMode }: { clearanceMode: "manual" | "flar
             <div className="flex items-center justify-between gap-4 rounded-md bg-muted/45 px-3 py-2.5">
               <Label htmlFor="egress-enabled">{t("settings.egress.enabled")}</Label>
               <Switch id="egress-enabled" checked={form.enabled} onCheckedChange={(enabled) => setForm({ ...form, enabled })} />
+            </div>
+            <div className="flex items-center justify-between gap-4 rounded-md bg-muted/45 px-3 py-2.5">
+              <div className="min-w-0">
+                <Label htmlFor="egress-force-no-cooldown">{t("settings.egress.forceNoCooldown")}</Label>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">{t("settings.egress.forceNoCooldownHelp")}</p>
+              </div>
+              <Switch id="egress-force-no-cooldown" checked={form.forceNoCooldown} onCheckedChange={(forceNoCooldown) => setForm({ ...form, forceNoCooldown })} />
             </div>
             <Field label={t("settings.egress.name")} controlId="egress-name">
               <Input id="egress-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />

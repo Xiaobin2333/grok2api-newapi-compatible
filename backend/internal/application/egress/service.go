@@ -31,6 +31,7 @@ type Input struct {
 	Name              string
 	Scope             domain.Scope
 	Enabled           bool
+	ForceNoCooldown   bool
 	ProxyURL          *string
 	ClearProxyURL     bool
 	UserAgent         string
@@ -165,7 +166,10 @@ func (s *Service) applyInput(value domain.Node, input Input, create bool) (domai
 	if input.Scope != domain.ScopeBuild && input.Scope != domain.ScopeWeb && input.Scope != domain.ScopeConsole && input.Scope != domain.ScopeWebAsset {
 		return domain.Node{}, fmt.Errorf("%w: scope 必须是 grok_build、grok_web、grok_console 或 grok_web_asset", ErrInvalidInput)
 	}
-	value.Name, value.Scope, value.Enabled = name, input.Scope, input.Enabled
+	value.Name, value.Scope, value.Enabled, value.ForceNoCooldown = name, input.Scope, input.Enabled, input.ForceNoCooldown
+	if value.ForceNoCooldown {
+		value.CooldownUntil = nil
+	}
 	if input.Scope == domain.ScopeBuild {
 		// Build 请求始终沿用 Provider 生成的 CLI User-Agent，出口节点不得覆盖协议身份。
 		value.UserAgent = ""
@@ -228,7 +232,7 @@ func (s *Service) publicNode(value domain.Node) domain.PublicNode {
 		userAgent = ""
 	}
 	return domain.PublicNode{
-		ID: value.ID, Name: value.Name, Scope: value.Scope, Enabled: value.Enabled,
+		ID: value.ID, Name: value.Name, Scope: value.Scope, Enabled: value.Enabled, ForceNoCooldown: value.ForceNoCooldown,
 		ProxyConfigured: value.EncryptedProxyURL != "", UserAgent: userAgent, CookieConfigured: value.EncryptedCloudflareCookie != "",
 		AccountBoundProxy: s.accountBoundProxy(value),
 		Health:            value.Health, FailureCount: value.FailureCount, CooldownUntil: value.CooldownUntil, LastError: value.LastError,
