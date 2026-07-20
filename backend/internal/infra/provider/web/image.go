@@ -761,9 +761,7 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 		}
 		images = append(images, image)
 	}
-	if strings.TrimSpace(request.AspectRatio) != "" {
-		request.ImageURLs, images, request.Prompt = reorderLocalImageReferences(request.ImageURLs, images, request.Prompt, ratio)
-	}
+	request.ImageURLs, images, request.Prompt = reorderImageReferencesByAspectRatio(request.ImageURLs, images, request.Prompt, ratio)
 	refs := make([]string, 0, len(images))
 	parentID := ""
 	directUploadAvailable := true
@@ -845,9 +843,7 @@ func (a *Adapter) editBasicImageViaChat(ctx context.Context, request provider.Im
 		}
 		images = append(images, image)
 	}
-	if strings.TrimSpace(request.AspectRatio) != "" {
-		request.ImageURLs, images, request.Prompt = reorderLocalImageReferences(request.ImageURLs, images, request.Prompt, ratio)
-	}
+	request.ImageURLs, images, request.Prompt = reorderImageReferencesByAspectRatio(request.ImageURLs, images, request.Prompt, ratio)
 
 	attachments := make([]string, 0, len(images))
 	directUploadAvailable := true
@@ -863,7 +859,7 @@ func (a *Adapter) editBasicImageViaChat(ctx context.Context, request provider.Im
 		attachments = append(attachments, uploaded.ID)
 	}
 
-	payload := buildWebChatPayload(basicImageEditPrompt(request.Prompt, ratio), "fast", attachments)
+	payload := buildBasicImageEditPayload(request.Prompt, ratio, len(attachments), attachments)
 	response, err := a.postJSONWithReferer(
 		ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload,
 		time.Duration(cfg.ImageTimeoutSeconds)*time.Second, cfg.BaseURL+"/",
@@ -980,19 +976,39 @@ func bufferedImageEditPartialURLs(captured []byte, limit int) []string {
 	return values
 }
 
-func basicImageEditPrompt(prompt, ratio string) string {
-	prompt = strings.TrimSpace(prompt)
-	message := "Drawing: Edit the attached reference image"
-	if prompt != "" {
-		message += " according to these instructions: " + prompt
+func buildBasicImageEditPayload(prompt, ratio string, referenceCount int, attachments []string) map[string]any {
+	payload := buildWebChatPayload(basicImageEditPrompt(prompt, ratio, referenceCount), "fast", attachments)
+	payload["disableSearch"] = true
+	payload["disableTextFollowUps"] = true
+	payload["imageGenerationCount"] = 1
+	payload["toolOverrides"] = map[string]any{"imageGen": true}
+	if _, ok := numericAspectRatio(ratio); ok {
+		payload["responseMetadata"] = map[string]any{"modelConfigOverride": map[string]any{"modelMap": map[string]any{
+			"imageGenModelConfig": map[string]any{"aspectRatio": ratio},
+		}}}
 	}
-	if strings.TrimSpace(ratio) != "" {
-		message += ". Create the final image with aspect ratio " + ratio
-	}
-	return message + ". Return the generated image only, not a textual description."
+	return payload
 }
 
-func reorderLocalImageReferences(rawURLs []string, images []provider.ImageInput, prompt, aspectRatio string) ([]string, []provider.ImageInput, string) {
+func basicImageEditPrompt(prompt, ratio string, referenceCount int) string {
+	prompt = strings.TrimSpace(prompt)
+	message := "Drawing: Perform a faithful image edit using the attached reference image as the visual source of truth"
+	if referenceCount > 1 {
+		message = fmt.Sprintf("Drawing: Perform a faithful image edit using all %d attached reference images, numbered image 1 through image %d in attachment order", referenceCount, referenceCount)
+		message += ". Keep each numbered reference's requested role (character, scene, object, or style) distinct; do not swap or merge their roles"
+	}
+	message += ". Preserve identity-defining facial features, body shape, pose, composition, clothing, objects, colors, lighting, and art style unless the edit instructions explicitly change them"
+	message += ". Apply only the requested changes and keep every other visible detail consistent"
+	if prompt != "" {
+		message += ". Edit instructions: " + prompt
+	}
+	if strings.TrimSpace(ratio) != "" {
+		message += ". The final canvas must use aspect ratio " + ratio + "; extend or recompose the background instead of distorting the referenced subjects"
+	}
+	return message + ". Return exactly one edited image and no textual description."
+}
+
+func reorderImageReferencesByAspectRatio(rawURLs []string, images []provider.ImageInput, prompt, aspectRatio string) ([]string, []provider.ImageInput, string) {
 	if len(rawURLs) != len(images) || len(images) < 2 {
 		return rawURLs, images, prompt
 	}
@@ -1002,10 +1018,7 @@ func reorderLocalImageReferences(rawURLs []string, images []provider.ImageInput,
 	}
 	bestIndex := -1
 	bestDistance := math.Inf(1)
-	for index, rawURL := range rawURLs {
-		if !isLocalMediaImageURL(rawURL) {
-			continue
-		}
+	for index := range rawURLs {
 		width, height, ok := referenceImageDimensions(images[index])
 		if !ok {
 			continue
@@ -1088,16 +1101,6 @@ func numericAspectRatio(value string) (float64, bool) {
 		return 0, false
 	}
 	return width / height, true
-}
-
-func isLocalMediaImageURL(value string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(value))
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return false
-	}
-	const marker = "/v1/media/images/"
-	index := strings.LastIndex(parsed.EscapedPath(), marker)
-	return index >= 0 && strings.Trim(strings.TrimPrefix(parsed.EscapedPath()[index:], marker), "/") != ""
 }
 
 func referenceOrder(length, first int) []int {

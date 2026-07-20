@@ -693,10 +693,15 @@ func TestBasicImageEditUsesFastChatAttachmentsAndRejectsTextOnlyResult(t *testin
 			}
 			attachments, _ := payload["fileAttachments"].([]any)
 			message, _ := payload["message"].(string)
-			if payload["modeId"] != "fast" || payload["enableImageGeneration"] != true || len(attachments) != 1 || attachments[0] != "file_1" {
+			toolOverrides, _ := payload["toolOverrides"].(map[string]any)
+			metadata, _ := payload["responseMetadata"].(map[string]any)
+			override, _ := metadata["modelConfigOverride"].(map[string]any)
+			modelMap, _ := override["modelMap"].(map[string]any)
+			imageConfig, _ := modelMap["imageGenModelConfig"].(map[string]any)
+			if payload["modeId"] != "fast" || payload["enableImageGeneration"] != true || payload["disableSearch"] != true || payload["disableTextFollowUps"] != true || payload["imageGenerationCount"] != float64(1) || toolOverrides["imageGen"] != true || imageConfig["aspectRatio"] != "16:9" || len(attachments) != 1 || attachments[0] != "file_1" {
 				t.Errorf("Basic edit payload = %#v", payload)
 			}
-			if !strings.HasPrefix(message, "Drawing:") || !strings.Contains(message, "16:9") || !strings.Contains(message, "not a textual description") {
+			if !strings.HasPrefix(message, "Drawing:") || !strings.Contains(message, "16:9") || !strings.Contains(message, "visual source of truth") || !strings.Contains(message, "Apply only the requested changes") || !strings.Contains(message, "no textual description") {
 				t.Errorf("Basic edit message = %q", message)
 			}
 			writer.Header().Set("Content-Type", "text/event-stream")
@@ -801,7 +806,7 @@ func TestImageEditAspectRatioSupportsOpenAISize(t *testing.T) {
 	}
 }
 
-func TestReorderLocalImageReferencesForLandscapeOutput(t *testing.T) {
+func TestReorderImageReferencesForLandscapeOutput(t *testing.T) {
 	urls := []string{
 		"https://api.example/v1/media/images/role",
 		"https://api.example/v1/media/images/scene",
@@ -812,7 +817,7 @@ func TestReorderLocalImageReferencesForLandscapeOutput(t *testing.T) {
 	}
 	prompt := "保持图片1的角色和图片2的场景；IMAGE 1 defines the role, image 2 defines the scene"
 
-	gotURLs, gotImages, gotPrompt := reorderLocalImageReferences(urls, images, prompt, "16:9")
+	gotURLs, gotImages, gotPrompt := reorderImageReferencesByAspectRatio(urls, images, prompt, "16:9")
 	if !slices.Equal(gotURLs, []string{urls[1], urls[0]}) || gotImages[0].Filename != "scene.png" || gotImages[1].Filename != "role.png" {
 		t.Fatalf("urls=%#v images=%q,%q", gotURLs, gotImages[0].Filename, gotImages[1].Filename)
 	}
@@ -822,7 +827,7 @@ func TestReorderLocalImageReferencesForLandscapeOutput(t *testing.T) {
 	}
 }
 
-func TestReorderLocalImageReferencesForPortraitOutput(t *testing.T) {
+func TestReorderImageReferencesForPortraitOutput(t *testing.T) {
 	urls := []string{
 		"https://api.example/base/v1/media/images/role",
 		"https://api.example/base/v1/media/images/scene",
@@ -835,7 +840,7 @@ func TestReorderLocalImageReferencesForPortraitOutput(t *testing.T) {
 	}
 	prompt := "image 1 是角色，图片2是场景，图片3是画风"
 
-	gotURLs, gotImages, gotPrompt := reorderLocalImageReferences(urls, images, prompt, "9:16")
+	gotURLs, gotImages, gotPrompt := reorderImageReferencesByAspectRatio(urls, images, prompt, "9:16")
 	if !slices.Equal(gotURLs, []string{urls[1], urls[0], urls[2]}) || gotImages[0].Filename != "scene.png" {
 		t.Fatalf("urls=%#v images=%#v", gotURLs, gotImages)
 	}
@@ -844,7 +849,7 @@ func TestReorderLocalImageReferencesForPortraitOutput(t *testing.T) {
 	}
 }
 
-func TestReorderLocalImageReferencesKeepsOrderWithoutDimensions(t *testing.T) {
+func TestReorderImageReferencesKeepsOrderWithoutDimensions(t *testing.T) {
 	urls := []string{
 		"https://external.example/role.png",
 		"https://api.example/v1/media/images/broken",
@@ -855,9 +860,38 @@ func TestReorderLocalImageReferencesKeepsOrderWithoutDimensions(t *testing.T) {
 	}
 	prompt := "图片1是角色，image 2 is style"
 
-	gotURLs, gotImages, gotPrompt := reorderLocalImageReferences(urls, images, prompt, "16:9")
+	gotURLs, gotImages, gotPrompt := reorderImageReferencesByAspectRatio(urls, images, prompt, "16:9")
 	if !slices.Equal(gotURLs, urls) || gotImages[0].Filename != "role.png" || gotPrompt != prompt {
 		t.Fatalf("urls=%#v images=%#v prompt=%q", gotURLs, gotImages, gotPrompt)
+	}
+}
+
+func TestReorderImageReferencesUsesAlreadyLoadedExternalDimensions(t *testing.T) {
+	urls := []string{"https://external.example/character.png", "https://external.example/scene.png"}
+	images := []provider.ImageInput{
+		{Filename: "character.png", MIMEType: "image/png", Data: testPNG(t, 600, 900)},
+		{Filename: "scene.png", MIMEType: "image/png", Data: testPNG(t, 1600, 900)},
+	}
+	prompt := "图片1是角色，图片2是场景"
+
+	gotURLs, gotImages, gotPrompt := reorderImageReferencesByAspectRatio(urls, images, prompt, "16:9")
+	if !slices.Equal(gotURLs, []string{urls[1], urls[0]}) || gotImages[0].Filename != "scene.png" || gotPrompt != "图片2是角色，图片1是场景" {
+		t.Fatalf("urls=%#v images=%#v prompt=%q", gotURLs, gotImages, gotPrompt)
+	}
+}
+
+func TestBuildBasicImageEditPayloadKeepsMultiReferenceSemantics(t *testing.T) {
+	payload := buildBasicImageEditPayload("图片1是角色，图片2是场景", "9:16", 2, []string{"file_1", "file_2"})
+	message, _ := payload["message"].(string)
+	if !strings.Contains(message, "all 2 attached reference images") || !strings.Contains(message, "do not swap or merge their roles") || !strings.Contains(message, "图片1是角色，图片2是场景") {
+		t.Fatalf("message=%q", message)
+	}
+	metadata := payload["responseMetadata"].(map[string]any)
+	override := metadata["modelConfigOverride"].(map[string]any)
+	modelMap := override["modelMap"].(map[string]any)
+	config := modelMap["imageGenModelConfig"].(map[string]any)
+	if config["aspectRatio"] != "9:16" {
+		t.Fatalf("image config=%#v", config)
 	}
 }
 
