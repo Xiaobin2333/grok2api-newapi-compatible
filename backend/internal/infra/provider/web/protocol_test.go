@@ -59,6 +59,24 @@ func TestCatalogMatchesSupportedSurface(t *testing.T) {
 	}
 }
 
+func TestBasicAccountsExposeImageEditThroughFastMode(t *testing.T) {
+	adapter := &Adapter{cfg: Config{EnableBasicImageEditViaChat: true}}
+	models, err := adapter.ListModels(context.Background(), account.Credential{WebTier: account.WebTierBasic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(models, "imagine-image-edit") {
+		t.Fatalf("Basic models = %#v", models)
+	}
+	if tiers := adapter.TierOrder("imagine-image-edit"); !slices.Equal(tiers, []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy}) {
+		t.Fatalf("image edit tier order = %#v", tiers)
+	}
+	adapter.UpdateConfig(Config{EnableBasicImageEditViaChat: false})
+	if tiers := adapter.TierOrder("imagine-image-edit"); !slices.Equal(tiers, []account.WebTier{account.WebTierSuper, account.WebTierHeavy}) {
+		t.Fatalf("disabled Basic image edit tier order = %#v", tiers)
+	}
+}
+
 func TestParseMediaPostResponsePreservesStatusAndPostID(t *testing.T) {
 	postID, err := parseMediaPostResponse(&http.Response{
 		StatusCode: http.StatusOK,
@@ -659,6 +677,88 @@ func TestImageEditRejectsUnconfirmedCountAndResolution(t *testing.T) {
 	}
 }
 
+func TestBasicImageEditUsesFastChatAttachmentsAndRejectsTextOnlyResult(t *testing.T) {
+	dataURI := "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+	uploaded := false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/http/upload-file-v2/direct":
+			uploaded = true
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"uploadId":"upload_1","fileMetadata":{"fileMetadataId":"file_1","fileUri":"users/test/reference/content"}}`)
+		case "/rest/app-chat/conversations/new":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode payload: %v", err)
+			}
+			attachments, _ := payload["fileAttachments"].([]any)
+			message, _ := payload["message"].(string)
+			if payload["modeId"] != "fast" || payload["enableImageGeneration"] != true || len(attachments) != 1 || attachments[0] != "file_1" {
+				t.Errorf("Basic edit payload = %#v", payload)
+			}
+			if !strings.HasPrefix(message, "Drawing:") || !strings.Contains(message, "16:9") || !strings.Contains(message, "not a textual description") {
+				t.Errorf("Basic edit message = %q", message)
+			}
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, `{"result":{"response":{"token":"The image was generated elsewhere.","isThinking":false,"messageTag":"final"}}}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statsig := base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{'s'}, 70))
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: statsig, EnableBasicImageEditViaChat: true}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	response, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
+		Credential: account.Credential{ID: 1, WebTier: account.WebTierBasic, EncryptedAccessToken: encrypted},
+		Prompt:     "keep the character", ImageURLs: []string{dataURI}, Count: 1, Resolution: "1k", AspectRatio: "16:9",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if !uploaded || response.StatusCode != http.StatusBadGateway || !bytes.Contains(body, []byte(`"code":"image_edit_incomplete"`)) {
+		t.Fatalf("uploaded=%t status=%d body=%s", uploaded, response.StatusCode, body)
+	}
+	streamResponse, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
+		Credential: account.Credential{ID: 1, WebTier: account.WebTierBasic, EncryptedAccessToken: encrypted},
+		Prompt:     "keep the character", ImageURLs: []string{dataURI}, Count: 1, Resolution: "1k", AspectRatio: "16:9", Streaming: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer streamResponse.Body.Close()
+	streamBody, _ := io.ReadAll(streamResponse.Body)
+	if streamResponse.StatusCode != http.StatusBadGateway || streamResponse.QuotaMode != "fast" || !bytes.Contains(streamBody, []byte(`"code":"image_edit_incomplete"`)) {
+		t.Fatalf("stream status=%d quota=%q body=%s", streamResponse.StatusCode, streamResponse.QuotaMode, streamBody)
+	}
+}
+
+func TestBasicImageEditSwitchBlocksChatAndImagineFallback(t *testing.T) {
+	adapter := &Adapter{cfg: Config{EnableBasicImageEditViaChat: false}}
+	response, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
+		Credential: account.Credential{ID: 1, WebTier: account.WebTierBasic},
+		Prompt:     "edit", ImageURLs: []string{"data:image/png;base64,a"}, Count: 1, Resolution: "1k",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusServiceUnavailable || !bytes.Contains(body, []byte(`"code":"upstream_unavailable"`)) {
+		t.Fatalf("status=%d body=%s", response.StatusCode, body)
+	}
+}
+
 func TestBuildImageEditPayloadMatchesCapturedAspectRatioShape(t *testing.T) {
 	payload := buildImageEditPayload("改成兔子", []string{"https://assets.grok.com/users/test/reference/content"}, "post_1", "1:1")
 	metadata, _ := payload["responseMetadata"].(map[string]any)
@@ -969,6 +1069,12 @@ func TestOnlyChatModelsExposeRateLimitModes(t *testing.T) {
 		if spec.ProtocolModel == "imagine-lite" {
 			if spec.Mode != "fast" {
 				t.Fatalf("Lite image must use fast quota mode, got %q", spec.Mode)
+			}
+			continue
+		}
+		if spec.Capability == modeldomain.CapabilityImageEdit {
+			if spec.Mode != "fast" {
+				t.Fatalf("Free/Basic image edit must select with fast quota mode, got %q", spec.Mode)
 			}
 			continue
 		}

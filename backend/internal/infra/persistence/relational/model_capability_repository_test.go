@@ -85,6 +85,60 @@ func TestModelCapabilitiesAggregateAndGateEnabledRoutes(t *testing.T) {
 	}
 }
 
+func TestInitializeSchemaBackfillsWebImageEditCapability(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+
+	webAccount, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, Name: "legacy-web", SourceKey: "legacy-web",
+		EncryptedAccessToken: testEncryptedToken, Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildAccount, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "legacy-build", SourceKey: "legacy-build",
+		EncryptedAccessToken: testEncryptedToken, Enabled: true, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, webAccount.ID, []string{"fast"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, buildAccount.ID, []string{"grok-4"}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatalf("migration is not idempotent: %v", err)
+	}
+
+	var webCount int64
+	if err := database.db.Model(&accountModelCapabilityModel{}).
+		Where("account_id = ? AND upstream_model = ?", webAccount.ID, "imagine-image-edit").
+		Count(&webCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if webCount != 1 {
+		t.Fatalf("Web image edit capability rows = %d, want 1", webCount)
+	}
+	var buildCount int64
+	if err := database.db.Model(&accountModelCapabilityModel{}).
+		Where("account_id = ? AND upstream_model = ?", buildAccount.ID, "imagine-image-edit").
+		Count(&buildCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if buildCount != 0 {
+		t.Fatalf("Build image edit capability rows = %d, want 0", buildCount)
+	}
+}
+
 func TestBuildPaidCapabilitiesAreSharedAcrossActiveSuperAccounts(t *testing.T) {
 	ctx := context.Background()
 	database := openTestDatabase(t)

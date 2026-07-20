@@ -287,6 +287,7 @@ func cloneLiteImageFailureResponse(response *provider.Response, body []byte) *pr
 		Status:     response.Status,
 		Header:     response.Header.Clone(),
 		Body:       io.NopCloser(bytes.NewReader(body)),
+		QuotaMode:  response.QuotaMode,
 		Diagnostic: response.Diagnostic,
 	}
 }

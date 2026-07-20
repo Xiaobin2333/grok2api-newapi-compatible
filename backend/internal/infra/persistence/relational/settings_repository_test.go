@@ -33,7 +33,7 @@ func TestRuntimeSettingsRepositoryRoundTrip(t *testing.T) {
 	}
 	settings := settingsdomain.Config{
 		Server:      settingsdomain.ServerConfig{MaxConcurrentRequests: 2048},
-		ProviderWeb: settingsdomain.ProviderWebConfig{StatsigManualValue: "sensitive-statsig-value"},
+		ProviderWeb: settingsdomain.ProviderWebConfig{StatsigManualValue: "sensitive-statsig-value", EnableBasicImageEditViaChat: true},
 		Media: settingsdomain.MediaConfig{
 			MaxImageBytes: 16 << 20, MaxTotalBytes: 1 << 30, CleanupThresholdPercent: 80,
 			CleanupInterval: 10 * time.Minute,
@@ -51,7 +51,7 @@ func TestRuntimeSettingsRepositoryRoundTrip(t *testing.T) {
 	if value.Server != settings.Server || value.Routing != settings.Routing || value.Media != settings.Media || !storedUpdatedAt.Equal(updatedAt) || revision != 1 || storedRevision != revision {
 		t.Fatalf("saved value = %#v", value)
 	}
-	if value.ProviderWeb.StatsigManualValue != settings.ProviderWeb.StatsigManualValue {
+	if value.ProviderWeb.StatsigManualValue != settings.ProviderWeb.StatsigManualValue || !value.ProviderWeb.EnableBasicImageEditViaChat {
 		t.Fatalf("Statsig manual value = %q", value.ProviderWeb.StatsigManualValue)
 	}
 	var row runtimeSettingsModel

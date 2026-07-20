@@ -63,6 +63,15 @@ func TestSettingsResponseIncludesPreferFreeBuild(t *testing.T) {
 	}
 }
 
+func TestSettingsResponseIncludesBasicImageEditSwitch(t *testing.T) {
+	response := newSettingsResponse(settingsapp.Snapshot{Config: settingsapp.EditableConfig{
+		ProviderWeb: settingsapp.ProviderWebConfig{EnableBasicImageEditViaChat: true},
+	}})
+	if !response.Config.ProviderWeb.EnableBasicImageEditViaChat {
+		t.Fatal("enableBasicImageEditViaChat was lost from settings response")
+	}
+}
+
 func TestLegacySettingsRequestMayOmitAccounts(t *testing.T) {
 	var dto settingsConfigDTO
 	if err := json.Unmarshal([]byte(`{"server":{"maxConcurrentRequests":64}}`), &dto); err != nil {

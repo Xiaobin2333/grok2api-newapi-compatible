@@ -136,6 +136,9 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 	if err := d.backfillReauthMarkedAt(ctx); err != nil {
 		return fmt.Errorf("迁移 reauth_marked_at: %w", err)
 	}
+	if err := d.backfillWebImageEditCapabilities(ctx); err != nil {
+		return fmt.Errorf("迁移 Grok Web 图片编辑能力: %w", err)
+	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
 			return fmt.Errorf("初始化数据库索引: %w", err)
@@ -145,6 +148,23 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 		return fmt.Errorf("迁移模型 Provider 命名空间: %w", err)
 	}
 	return nil
+}
+
+// backfillWebImageEditCapabilities 让升级前已同步过能力快照的 Web 账号立即
+// 具备图片编辑候选资格；运行时开关继续决定 Basic 是否进入 fast-chat 路由。
+func (d *Database) backfillWebImageEditCapabilities(ctx context.Context) error {
+	return d.db.WithContext(ctx).Exec(`
+INSERT INTO account_model_capabilities (account_id, upstream_model)
+SELECT account.id, 'imagine-image-edit'
+FROM provider_accounts AS account
+WHERE account.provider = 'grok_web'
+  AND NOT EXISTS (
+    SELECT 1
+    FROM account_model_capabilities AS capability
+    WHERE capability.account_id = account.id
+      AND capability.upstream_model = 'imagine-image-edit'
+  )
+`).Error
 }
 
 func (d *Database) migrateVideoInputAssetPurposes(ctx context.Context) error {

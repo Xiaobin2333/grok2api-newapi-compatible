@@ -195,6 +195,7 @@ func (s *Service) executeImage(
 	var credential accountdomain.Credential
 	var response *provider.Response
 	var accountUsages []imageAccountUsage
+	var lastRetryableResponse *provider.Response
 	var lastCredentialFailure *accountdomain.Credential
 	var lastCredentialError error
 	parallelLite := operation == audit.OperationImage && route.Provider == accountdomain.ProviderWeb && pricingModel == "grok-imagine-image" && !streaming
@@ -217,6 +218,11 @@ func (s *Service) executeImage(
 		for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, "", excluded, false)
 			if err != nil {
+				if lastRetryableResponse != nil {
+					response = lastRetryableResponse
+					lease = nil
+					break
+				}
 				writeFailureAudit(http.StatusServiceUnavailable, "upstream_unavailable", lastCredentialFailure)
 				return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, err)
 			}
@@ -274,9 +280,13 @@ func (s *Service) executeImage(
 				}
 				continue
 			}
-			if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && lease.QuotaMode != "" {
+			responseQuotaMode := lease.QuotaMode
+			if response.QuotaMode != "" {
+				responseQuotaMode = response.QuotaMode
+			}
+			if quotaKind, _ := s.providers.QuotaKind(credential.Provider); quotaKind == provider.QuotaRemoteWindow && response.StatusCode == http.StatusTooManyRequests && responseQuotaMode != "" {
 				retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
-				exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				exhausted, reconcileErr := s.accounts.ReconcileWebRateLimit(ctx, credential.ID, responseQuotaMode, retryAfter)
 				s.selector.MarkQuotaStateChanged(credential.Provider)
 				if reconcileErr != nil || !exhausted {
 					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
@@ -286,6 +296,17 @@ func (s *Service) executeImage(
 					lease.Release()
 					continue
 				}
+			}
+			if operation == audit.OperationImageEdit && response.StatusCode >= http.StatusInternalServerError && attemptPolicy.hasNext(attempt) {
+				body, _ := readRetryableBody(response.Body)
+				lastRetryableResponse = cloneLiteImageFailureResponse(response, body)
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
+				s.selector.MarkFailure(ctx, credential, response.StatusCode, 0)
+				lease.Release()
+				lease = nil
+				response = nil
+				continue
 			}
 			break
 		}
@@ -298,7 +319,11 @@ func (s *Service) executeImage(
 		return nil, fmt.Errorf("%w: %w", ErrNoAvailableAccount, lastCredentialError)
 	}
 	if lease != nil {
-		accountUsages = []imageAccountUsage{{credential: credential, quotaMode: lease.QuotaMode, units: max(1, response.QuotaUnits)}}
+		responseQuotaMode := lease.QuotaMode
+		if response.QuotaMode != "" {
+			responseQuotaMode = response.QuotaMode
+		}
+		accountUsages = []imageAccountUsage{{credential: credential, quotaMode: responseQuotaMode, units: max(1, response.QuotaUnits)}}
 	}
 	accountID := credential.ID
 	var once sync.Once

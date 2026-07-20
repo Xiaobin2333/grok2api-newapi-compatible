@@ -49,6 +49,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	input.Routing.FreeAccountMaxConcurrent = 2
 	input.Routing.VideoPremiumAccountAttempts = 4
 	input.Routing.PreferFreeBuild = true
+	input.ProviderWeb.EnableBasicImageEditViaChat = true
 	input.Audit.BufferSize = cfg.Audit.BufferSize + 1
 	input.Media.MaxTotalBytes = 2 << 30
 	input.Media.CleanupThresholdPercent = 75
@@ -64,6 +65,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	}
 	if applied.Routing.MaxAttempts != 0 || applied.Routing.FreeAccountMaxConcurrent != 2 || applied.Routing.VideoPremiumAccountAttempts != 4 || !applied.Routing.PreferFreeBuild {
 		t.Fatalf("runtime configuration was not applied: %#v", applied.Routing)
+	}
+	if !applied.Provider.Web.EnableBasicImageEditViaChat {
+		t.Fatalf("Free/Basic Chat image edit setting was not applied: %#v", applied.Provider.Web)
 	}
 	if applied.Server.MaxConcurrentRequests != 2048 {
 		t.Fatalf("server configuration was not applied: %#v", applied.Server)
@@ -87,7 +91,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Routing.MaxAttempts != 0 || reloaded.Routing.FreeAccountMaxConcurrent != 2 || reloaded.Routing.VideoPremiumAccountAttempts != 4 || !reloaded.Routing.PreferFreeBuild || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
+	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Routing.MaxAttempts != 0 || reloaded.Routing.FreeAccountMaxConcurrent != 2 || reloaded.Routing.VideoPremiumAccountAttempts != 4 || !reloaded.Routing.PreferFreeBuild || !reloaded.Provider.Web.EnableBasicImageEditViaChat || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
 		t.Fatalf("configuration was not persisted")
 	}
 }

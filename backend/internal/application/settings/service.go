@@ -35,23 +35,24 @@ type ProviderBuildRecommendation struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL                 string
-	StatsigMode             string
-	StatsigManualValue      string
-	StatsigManualConfigured bool
-	StatsigSignerURL        string
-	ClearanceMode           string
-	FlareSolverrURL         string
-	ClearanceTimeout        string
-	ClearanceRefresh        string
-	QuotaTimeout            string
-	ChatTimeout             string
-	ImageTimeout            string
-	VideoTimeout            string
-	MediaConcurrency        int
-	AllowNSFW               bool
-	RecoveryBackoffBase     string
-	RecoveryBackoffMax      string
+	BaseURL                     string
+	StatsigMode                 string
+	StatsigManualValue          string
+	StatsigManualConfigured     bool
+	StatsigSignerURL            string
+	ClearanceMode               string
+	FlareSolverrURL             string
+	ClearanceTimeout            string
+	ClearanceRefresh            string
+	QuotaTimeout                string
+	ChatTimeout                 string
+	ImageTimeout                string
+	VideoTimeout                string
+	MediaConcurrency            int
+	AllowNSFW                   bool
+	EnableBasicImageEditViaChat bool
+	RecoveryBackoffBase         string
+	RecoveryBackoffMax          string
 	// ClearanceProvided distinguishes older admin clients that predate the
 	// managed-clearance fields from an explicit update to those fields.
 	ClearanceProvided bool
@@ -309,7 +310,8 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 		ChatTimeout: config.Duration(value.ProviderWeb.ChatTimeout), ImageTimeout: config.Duration(value.ProviderWeb.ImageTimeout),
 		VideoTimeout:     config.Duration(value.ProviderWeb.VideoTimeout),
 		MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
-		RecoveryBackoffBase: config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
+		EnableBasicImageEditViaChat: value.ProviderWeb.EnableBasicImageEditViaChat,
+		RecoveryBackoffBase:         config.Duration(value.ProviderWeb.RecoveryBackoffBase), RecoveryBackoffMax: config.Duration(value.ProviderWeb.RecoveryBackoffMax),
 	}
 	// Console 是后续版本新增的完整配置段；旧 JSON 整段缺失时沿用代码默认值。
 	if value.ProviderConsole != (settingsdomain.ProviderConsoleConfig{}) {
@@ -379,7 +381,8 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 			ChatTimeout: value.Provider.Web.ChatTimeout.Value(), ImageTimeout: value.Provider.Web.ImageTimeout.Value(),
 			VideoTimeout:     value.Provider.Web.VideoTimeout.Value(),
 			MediaConcurrency: value.Provider.Web.MediaConcurrency, AllowNSFW: value.Provider.Web.AllowNSFW,
-			RecoveryBackoffBase: value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
+			EnableBasicImageEditViaChat: value.Provider.Web.EnableBasicImageEditViaChat,
+			RecoveryBackoffBase:         value.Provider.Web.RecoveryBackoffBase.Value(), RecoveryBackoffMax: value.Provider.Web.RecoveryBackoffMax.Value(),
 		},
 		ProviderConsole: settingsdomain.ProviderConsoleConfig{
 			BaseURL: value.Provider.Console.BaseURL, ChatTimeout: value.Provider.Console.ChatTimeout.Value(),
@@ -463,6 +466,7 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	}
 	next.Provider.Web.MediaConcurrency = input.ProviderWeb.MediaConcurrency
 	next.Provider.Web.AllowNSFW = input.ProviderWeb.AllowNSFW
+	next.Provider.Web.EnableBasicImageEditViaChat = input.ProviderWeb.EnableBasicImageEditViaChat
 	next.Provider.Console.BaseURL = strings.TrimSpace(input.ProviderConsole.BaseURL)
 	next.Batch = config.BatchConfig{
 		ImportConcurrency: input.Batch.ImportConcurrency, ConversionConcurrency: input.Batch.ConversionConcurrency,
@@ -550,7 +554,8 @@ func toEditable(cfg config.Config) EditableConfig {
 			ChatTimeout: cfg.Provider.Web.ChatTimeout.String(), ImageTimeout: cfg.Provider.Web.ImageTimeout.String(),
 			VideoTimeout:     cfg.Provider.Web.VideoTimeout.String(),
 			MediaConcurrency: cfg.Provider.Web.MediaConcurrency, AllowNSFW: cfg.Provider.Web.AllowNSFW,
-			RecoveryBackoffBase: cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
+			EnableBasicImageEditViaChat: cfg.Provider.Web.EnableBasicImageEditViaChat,
+			RecoveryBackoffBase:         cfg.Provider.Web.RecoveryBackoffBase.String(), RecoveryBackoffMax: cfg.Provider.Web.RecoveryBackoffMax.String(),
 		},
 		ProviderConsole: ProviderConsoleConfig{
 			BaseURL: cfg.Provider.Console.BaseURL, ChatTimeout: cfg.Provider.Console.ChatTimeout.String(),

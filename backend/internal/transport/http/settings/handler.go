@@ -65,23 +65,24 @@ type providerBuildConfigDTO struct {
 }
 
 type providerWebConfigDTO struct {
-	BaseURL                 string  `json:"baseURL"`
-	StatsigMode             string  `json:"statsigMode"`
-	StatsigManualValue      string  `json:"statsigManualValue,omitempty"`
-	StatsigManualConfigured bool    `json:"statsigManualConfigured"`
-	StatsigSignerURL        string  `json:"statsigSignerURL"`
-	ClearanceMode           *string `json:"clearanceMode,omitempty"`
-	FlareSolverrURL         *string `json:"flareSolverrURL,omitempty"`
-	ClearanceTimeout        *string `json:"clearanceTimeout,omitempty"`
-	ClearanceRefresh        *string `json:"clearanceRefresh,omitempty"`
-	QuotaTimeout            string  `json:"quotaTimeout"`
-	ChatTimeout             string  `json:"chatTimeout"`
-	ImageTimeout            string  `json:"imageTimeout"`
-	VideoTimeout            string  `json:"videoTimeout"`
-	MediaConcurrency        int     `json:"mediaConcurrency"`
-	AllowNSFW               bool    `json:"allowNSFW"`
-	RecoveryBackoffBase     string  `json:"recoveryBackoffBase"`
-	RecoveryBackoffMax      string  `json:"recoveryBackoffMax"`
+	BaseURL                     string  `json:"baseURL"`
+	StatsigMode                 string  `json:"statsigMode"`
+	StatsigManualValue          string  `json:"statsigManualValue,omitempty"`
+	StatsigManualConfigured     bool    `json:"statsigManualConfigured"`
+	StatsigSignerURL            string  `json:"statsigSignerURL"`
+	ClearanceMode               *string `json:"clearanceMode,omitempty"`
+	FlareSolverrURL             *string `json:"flareSolverrURL,omitempty"`
+	ClearanceTimeout            *string `json:"clearanceTimeout,omitempty"`
+	ClearanceRefresh            *string `json:"clearanceRefresh,omitempty"`
+	QuotaTimeout                string  `json:"quotaTimeout"`
+	ChatTimeout                 string  `json:"chatTimeout"`
+	ImageTimeout                string  `json:"imageTimeout"`
+	VideoTimeout                string  `json:"videoTimeout"`
+	MediaConcurrency            int     `json:"mediaConcurrency"`
+	AllowNSFW                   bool    `json:"allowNSFW"`
+	EnableBasicImageEditViaChat bool    `json:"enableBasicImageEditViaChat"`
+	RecoveryBackoffBase         string  `json:"recoveryBackoffBase"`
+	RecoveryBackoffMax          string  `json:"recoveryBackoffMax"`
 }
 
 type batchConfigDTO struct {
@@ -185,7 +186,8 @@ func (value settingsConfigDTO) toApplication() settingsapp.EditableConfig {
 			ChatTimeout:       value.ProviderWeb.ChatTimeout, ImageTimeout: value.ProviderWeb.ImageTimeout,
 			VideoTimeout:     value.ProviderWeb.VideoTimeout,
 			MediaConcurrency: value.ProviderWeb.MediaConcurrency, AllowNSFW: value.ProviderWeb.AllowNSFW,
-			RecoveryBackoffBase: value.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: value.ProviderWeb.RecoveryBackoffMax,
+			EnableBasicImageEditViaChat: value.ProviderWeb.EnableBasicImageEditViaChat,
+			RecoveryBackoffBase:         value.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: value.ProviderWeb.RecoveryBackoffMax,
 		},
 		ProviderConsole: settingsapp.ProviderConsoleConfig{
 			BaseURL: value.ProviderConsole.BaseURL, ChatTimeout: value.ProviderConsole.ChatTimeout,
@@ -248,7 +250,8 @@ func newSettingsResponse(value settingsapp.Snapshot) settingsResponse {
 				ChatTimeout: config.ProviderWeb.ChatTimeout, ImageTimeout: config.ProviderWeb.ImageTimeout,
 				VideoTimeout:     config.ProviderWeb.VideoTimeout,
 				MediaConcurrency: config.ProviderWeb.MediaConcurrency, AllowNSFW: config.ProviderWeb.AllowNSFW,
-				RecoveryBackoffBase: config.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: config.ProviderWeb.RecoveryBackoffMax,
+				EnableBasicImageEditViaChat: config.ProviderWeb.EnableBasicImageEditViaChat,
+				RecoveryBackoffBase:         config.ProviderWeb.RecoveryBackoffBase, RecoveryBackoffMax: config.ProviderWeb.RecoveryBackoffMax,
 			},
 			ProviderConsole: providerConsoleConfigDTO{
 				BaseURL: config.ProviderConsole.BaseURL, ChatTimeout: config.ProviderConsole.ChatTimeout,

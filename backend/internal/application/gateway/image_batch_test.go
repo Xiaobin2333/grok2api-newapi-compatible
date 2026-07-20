@@ -168,6 +168,123 @@ func TestLiteImageBatchUsesMultipleAccountsAndRetriesFailedSlot(t *testing.T) {
 	}
 }
 
+func TestBasicImageEditRetriesAcrossAllAccountsAfterIncompleteResponse(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "basic-image-edit-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credentials := make([]account.Credential, 0, 2)
+	for index, name := range []string{"basic-edit-first", "basic-edit-second"} {
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted-" + name,
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200 - index*100, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
+		PublicID: "grok-imagine-image-edit", Provider: account.ProviderWeb, UpstreamModel: "imagine-image-edit",
+		Capability: modeldomain.CapabilityImageEdit, Enabled: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"imagine-image-edit"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "basic-edit-key", Prefix: "basic-edit", SecretHash: strings.Repeat("b", 64), EncryptedSecret: "encrypted-key",
+		Enabled: true, RPMLimit: 60, MaxConcurrent: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &basicImageEditRetryAdapter{firstID: credentials[0].ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, 0, 0)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(keyRepo, nil, nil, 60, 10, nil), registry, selector, relational.NewResponseRepository(database), 0)
+
+	result, err := service.EditImage(ctx, ImageEditInput{
+		RequestID: "req-basic-image-edit-retry", ClientKey: key,
+		PublicModel: "grok-imagine-image-edit", RequestedModel: "grok-imagine-image", EffectiveModel: "grok-imagine-image-edit", AutoRouted: true,
+		Prompt: "edit", ImageURLs: []string{"data:image/png;base64,a"}, Count: 1, Resolution: "1k", ResponseFormat: "url",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Body.Close()
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode != http.StatusOK || !strings.Contains(string(body), "edited.png") {
+		t.Fatalf("status=%d body=%s", result.StatusCode, body)
+	}
+	result.Finalize(Usage{}, "", "")
+	if attempts := adapter.Attempts(); len(attempts) != 2 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID {
+		t.Fatalf("image edit attempts = %#v, want [%d %d]", attempts, credentials[0].ID, credentials[1].ID)
+	}
+}
+
+type basicImageEditRetryAdapter struct {
+	mu       sync.Mutex
+	firstID  uint64
+	attempts []uint64
+}
+
+func (a *basicImageEditRetryAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (a *basicImageEditRetryAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider: account.ProviderWeb, ModelNamespace: account.ProviderWeb.ModelNamespace(),
+		Credential: provider.CredentialSurface{AuthType: account.AuthTypeSSO},
+		Media:      provider.MediaSurface{ImageEdit: true},
+	}
+}
+
+func (a *basicImageEditRetryAdapter) TierOrder(string) []account.WebTier {
+	return []account.WebTier{account.WebTierBasic}
+}
+
+func (a *basicImageEditRetryAdapter) PricingModel(string) string { return "grok-imagine-image-edit" }
+
+func (a *basicImageEditRetryAdapter) EditImage(_ context.Context, request provider.ImageEditRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.firstID {
+		return &provider.Response{
+			StatusCode: http.StatusBadGateway, Status: "502 Bad Gateway", Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"error":{"code":"image_edit_incomplete"}}`)), QuotaMode: "fast",
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: http.Header{"Content-Type": {"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{"created":1,"data":[{"url":"https://example.com/edited.png"}]}`)), QuotaUnits: 1, QuotaMode: "fast",
+	}, nil
+}
+
+func (a *basicImageEditRetryAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
+}
+
 type liteBatchAdapter struct {
 	mu                sync.Mutex
 	failOnceAccountID uint64

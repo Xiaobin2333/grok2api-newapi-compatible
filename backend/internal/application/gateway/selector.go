@@ -156,6 +156,7 @@ func (s *Selector) routingConfig() (time.Duration, time.Duration, time.Duration,
 func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstreamModel, quotaMode, affinityKey string, excluded map[uint64]bool, allowQuotaProbe bool) (*accountLease, error) {
 	now := time.Now().UTC()
 	stickyKey := stickySessionKey(affinityKey)
+	tierOrder := s.resolveTierOrder(provider, upstreamModel)
 	values, err := s.loadCandidates(ctx, provider, upstreamModel, quotaMode, now)
 	if err != nil {
 		return nil, err
@@ -175,6 +176,9 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			continue
 		}
 		consideredCandidates++
+		if provider == account.ProviderWeb && len(tierOrder) > 0 && !webTierAllowed(tierOrder, value.WebTier) {
+			continue
+		}
 		if candidate.ModelCapabilityKnown && !candidate.SupportsModel {
 			continue
 		}
@@ -229,7 +233,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 		return nil, &SelectionUnavailableError{Reason: reason, RetryAfter: retryDelay(now, earliestRetry)}
 	}
 	if len(probeCandidates) > 0 {
-		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, probeCandidates, now, tierOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -277,7 +281,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 					lease, acquireErr := s.acquirePinnedCapacity(ctx, candidate)
 					if acquireErr == nil {
 						lease.Billing = candidate.Billing
-						lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+						lease.QuotaMode = effectiveQuotaMode(candidate, upstreamModel, quotaMode)
 						return lease, nil
 					}
 					if !isSelectionUnavailable(acquireErr, SelectionSaturated) {
@@ -291,7 +295,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	// 粘性账号仅因并发满载而暂时不可用时，先等待该账号；超时后允许本次请求临时借用
 	// 其他账号，但不覆盖原绑定，避免并行请求让活跃会话在账号池中来回抖动。
 	if saturatedStickyID != 0 {
-		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, time.Now().UTC(), tierOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -307,7 +311,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 				continue
 			}
 			lease.Billing = candidate.Billing
-			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+			lease.QuotaMode = effectiveQuotaMode(candidate, upstreamModel, quotaMode)
 			return lease, nil
 		}
 		return nil, &SelectionUnavailableError{Reason: SelectionSaturated, RetryAfter: time.Second}
@@ -316,7 +320,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 	waitDeadline := time.Now().Add(capacityWait)
 	for {
 		currentTime := time.Now().UTC()
-		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, s.resolveTierOrder(provider, upstreamModel))
+		plan, err := s.planCandidateIndexes(ctx, values, normalCandidates, currentTime, tierOrder)
 		if err != nil {
 			return nil, err
 		}
@@ -341,7 +345,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 						if boundErr == nil {
 							lease.Release()
 							boundLease.Billing = boundCandidate.Billing
-							boundLease.QuotaMode = effectiveQuotaMode(boundCandidate, quotaMode)
+							boundLease.QuotaMode = effectiveQuotaMode(boundCandidate, upstreamModel, quotaMode)
 							return boundLease, nil
 						}
 						if !isSelectionUnavailable(boundErr, SelectionSaturated) {
@@ -356,7 +360,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 				}
 			}
 			lease.Billing = candidate.Billing
-			lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+			lease.QuotaMode = effectiveQuotaMode(candidate, upstreamModel, quotaMode)
 			return lease, nil
 		}
 		if capacityWait <= 0 {
@@ -462,14 +466,17 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 			return nil, err
 		}
 		lease.Billing = candidate.Billing
-		lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
+		lease.QuotaMode = effectiveQuotaMode(candidate, upstreamModel, quotaMode)
 		return lease, nil
 	}
 	return nil, &SelectionUnavailableError{Reason: SelectionNoAccounts}
 }
 
-func effectiveQuotaMode(candidate account.RoutingCandidate, fallback string) string {
+func effectiveQuotaMode(candidate account.RoutingCandidate, upstreamModel, fallback string) string {
 	if candidate.QuotaWindow != nil && candidate.QuotaWindow.Mode == "weekly" {
+		return "weekly"
+	}
+	if candidate.Credential.Provider == account.ProviderWeb && upstreamModel == "imagine-image-edit" && !basicWebRoutingTier(candidate.Credential.WebTier) {
 		return "weekly"
 	}
 	return fallback
@@ -788,4 +795,20 @@ func tierOrderRank(order []account.WebTier, tier account.WebTier) int {
 		}
 	}
 	return len(order)
+}
+
+func webTierAllowed(order []account.WebTier, tier account.WebTier) bool {
+	if basicWebRoutingTier(tier) {
+		tier = account.WebTierBasic
+	}
+	for _, allowed := range order {
+		if tier == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func basicWebRoutingTier(tier account.WebTier) bool {
+	return tier == "" || tier == account.WebTierAuto || tier == account.WebTierBasic
 }

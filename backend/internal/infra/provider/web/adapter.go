@@ -14,16 +14,17 @@ import (
 )
 
 type Config struct {
-	BaseURL             string
-	StatsigMode         string
-	StatsigManualValue  string
-	StatsigSignerURL    string
-	QuotaTimeoutSeconds int
-	ChatTimeoutSeconds  int
-	ImageTimeoutSeconds int
-	VideoTimeoutSeconds int
-	MaxInputImageBytes  int64
-	AllowNSFW           bool
+	BaseURL                     string
+	StatsigMode                 string
+	StatsigManualValue          string
+	StatsigSignerURL            string
+	QuotaTimeoutSeconds         int
+	ChatTimeoutSeconds          int
+	ImageTimeoutSeconds         int
+	VideoTimeoutSeconds         int
+	MaxInputImageBytes          int64
+	AllowNSFW                   bool
+	EnableBasicImageEditViaChat bool
 }
 
 type Adapter struct {
@@ -114,6 +115,9 @@ func (a *Adapter) TierOrder(upstreamModel string) []account.WebTier {
 	spec, ok := Resolve(upstreamModel)
 	if !ok {
 		return nil
+	}
+	if spec.Capability == modeldomain.CapabilityImageEdit && !a.config().EnableBasicImageEditViaChat {
+		return []account.WebTier{account.WebTierSuper, account.WebTierHeavy}
 	}
 	switch spec.MinimumTier {
 	case account.WebTierHeavy:

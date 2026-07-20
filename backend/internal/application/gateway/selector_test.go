@@ -316,6 +316,63 @@ func TestSelectorKeepsWebQuotaModesIsolated(t *testing.T) {
 	}
 }
 
+func TestSelectorUsesFastQuotaForBasicImageEditAndWeeklyForPaidFallback(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-basic-edit-quota.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	basic, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+		Name: "basic-edit", SourceKey: "basic-edit", EncryptedAccessToken: "encrypted",
+		AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paid, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "paid-edit", SourceKey: "paid-edit", EncryptedAccessToken: "encrypted",
+		AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	resetAt := now.Add(time.Hour)
+	for _, value := range []account.Credential{basic, paid} {
+		fastRemaining := 0
+		if value.ID == paid.ID {
+			fastRemaining = 9
+		}
+		windows := []account.QuotaWindow{
+			{AccountID: value.ID, Mode: "fast", Remaining: fastRemaining, Total: 10, ResetAt: &resetAt, Source: account.QuotaSourceUpstream},
+		}
+		if value.ID == basic.ID {
+			windows = append(windows, account.QuotaWindow{AccountID: value.ID, Mode: "weekly", Remaining: 5, Total: 10, ResetAt: &resetAt, Source: account.QuotaSourceUpstream})
+		}
+		if err := accounts.SaveQuotaWindows(ctx, value.ID, value.WebTier, now, windows); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierOrder{
+		order: []account.WebTier{account.WebTierBasic, account.WebTierSuper, account.WebTierHeavy},
+	}, time.Hour, time.Second, time.Minute)
+	lease, err := selector.Acquire(ctx, account.ProviderWeb, "imagine-image-edit", "fast", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.ID != paid.ID || lease.QuotaMode != "weekly" {
+		t.Fatalf("lease account=%d mode=%q, want paid=%d weekly", lease.Credential.ID, lease.QuotaMode, paid.ID)
+	}
+}
+
 func TestSelectorHonorsWebTierPoolOrderBeforeAccountPriority(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-web-tier.db"))
@@ -345,6 +402,39 @@ func TestSelectorHonorsWebTierPoolOrderBeforeAccountPriority(t *testing.T) {
 	defer lease.Release()
 	if lease.Credential.WebTier != account.WebTierHeavy {
 		t.Fatalf("selected tier = %s", lease.Credential.WebTier)
+	}
+}
+
+func TestSelectorExcludesWebTiersOutsideProviderOrder(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "selector-web-tier-filter.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	for index, tier := range []account.WebTier{account.WebTierBasic, account.WebTierSuper} {
+		if _, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
+			Name: string(tier), SourceKey: "filtered-" + string(tier), EncryptedAccessToken: "encrypted",
+			AuthStatus: account.AuthStatusActive, Priority: 200 - index*100, MaxConcurrent: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), staticTierOrder{
+		order: []account.WebTier{account.WebTierSuper, account.WebTierHeavy},
+	}, time.Hour, time.Second, time.Minute)
+	lease, err := selector.Acquire(ctx, account.ProviderWeb, "imagine-image-edit", "fast", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Credential.WebTier != account.WebTierSuper {
+		t.Fatalf("selected tier = %s, want super", lease.Credential.WebTier)
 	}
 }
 

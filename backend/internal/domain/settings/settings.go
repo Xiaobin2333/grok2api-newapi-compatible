@@ -40,22 +40,23 @@ type MediaConfig struct {
 }
 
 type ProviderWebConfig struct {
-	BaseURL             string
-	StatsigMode         string
-	StatsigManualValue  string
-	StatsigSignerURL    string
-	ClearanceMode       string
-	FlareSolverrURL     string
-	ClearanceTimeout    time.Duration
-	ClearanceRefresh    time.Duration
-	QuotaTimeout        time.Duration
-	ChatTimeout         time.Duration
-	ImageTimeout        time.Duration
-	VideoTimeout        time.Duration
-	MediaConcurrency    int
-	AllowNSFW           bool
-	RecoveryBackoffBase time.Duration
-	RecoveryBackoffMax  time.Duration
+	BaseURL                     string
+	StatsigMode                 string
+	StatsigManualValue          string
+	StatsigSignerURL            string
+	ClearanceMode               string
+	FlareSolverrURL             string
+	ClearanceTimeout            time.Duration
+	ClearanceRefresh            time.Duration
+	QuotaTimeout                time.Duration
+	ChatTimeout                 time.Duration
+	ImageTimeout                time.Duration
+	VideoTimeout                time.Duration
+	MediaConcurrency            int
+	AllowNSFW                   bool
+	EnableBasicImageEditViaChat bool
+	RecoveryBackoffBase         time.Duration
+	RecoveryBackoffMax          time.Duration
 }
 
 // BatchConfig 定义账号导入、转换、同步和凭据刷新的并发上限。

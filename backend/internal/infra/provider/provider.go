@@ -137,6 +137,7 @@ type Response struct {
 	Header      http.Header
 	Body        io.ReadCloser
 	QuotaUnits  int
+	QuotaMode   string
 	UpstreamURL string
 	Diagnostic  *DiagnosticResponse
 	RateLimit   *RateLimitMetadata

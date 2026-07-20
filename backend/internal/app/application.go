@@ -337,7 +337,7 @@ func webProviderConfig(cfg config.Config) webprovider.Config {
 		StatsigSignerURL:   cfg.Provider.Web.StatsigSignerURL,
 		ChatTimeoutSeconds: int(cfg.Provider.Web.ChatTimeout.Value().Seconds()), ImageTimeoutSeconds: int(cfg.Provider.Web.ImageTimeout.Value().Seconds()),
 		VideoTimeoutSeconds: int(cfg.Provider.Web.VideoTimeout.Value().Seconds()), MaxInputImageBytes: cfg.Media.MaxImageBytes,
-		AllowNSFW: cfg.Provider.Web.AllowNSFW,
+		AllowNSFW: cfg.Provider.Web.AllowNSFW, EnableBasicImageEditViaChat: cfg.Provider.Web.EnableBasicImageEditViaChat,
 	}
 }
 

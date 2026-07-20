@@ -216,12 +216,30 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		if quotaMode != "" {
 			modes = append(modes, quotaMode)
 		}
-		if err := r.db.db.WithContext(ctx).Where("account_id IN ? AND mode IN ?", ids, modes).Order("CASE WHEN mode = 'weekly' THEN 0 ELSE 1 END").Find(&rows).Error; err != nil {
+		if err := r.db.db.WithContext(ctx).Where("account_id IN ? AND mode IN ?", ids, modes).Find(&rows).Error; err != nil {
 			return nil, err
 		}
+		byAccountAndMode := make(map[uint64]map[string]quotaWindowModel, len(ids))
 		for _, row := range rows {
-			if _, exists := quotaWindows[row.AccountID]; !exists {
-				quotaWindows[row.AccountID] = toQuotaWindowDomain(row)
+			if byAccountAndMode[row.AccountID] == nil {
+				byAccountAndMode[row.AccountID] = make(map[string]quotaWindowModel, len(modes))
+			}
+			byAccountAndMode[row.AccountID][row.Mode] = row
+		}
+		for _, value := range values {
+			mode := quotaMode
+			if provider == account.ProviderWeb && !basicWebAccountTier(value.WebTier) {
+				if upstreamModel == "imagine-image-edit" {
+					mode = "weekly"
+				} else if _, hasWeekly := byAccountAndMode[value.ID]["weekly"]; hasWeekly {
+					mode = "weekly"
+				}
+			}
+			if mode == "" && provider == account.ProviderWeb {
+				mode = "weekly"
+			}
+			if row, exists := byAccountAndMode[value.ID][mode]; exists {
+				quotaWindows[value.ID] = toQuotaWindowDomain(row)
 			}
 		}
 	}
@@ -297,6 +315,10 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 		result = append(result, candidate)
 	}
 	return result, nil
+}
+
+func basicWebAccountTier(tier account.WebTier) bool {
+	return tier == "" || tier == account.WebTierAuto || tier == account.WebTierBasic
 }
 
 func (r *AccountRepository) ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error) {

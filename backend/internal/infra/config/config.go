@@ -139,22 +139,23 @@ type BuildProviderConfig struct {
 const DefaultBuildFallbackBaseURL = "https://api.x.ai/v1"
 
 type WebProviderConfig struct {
-	BaseURL             string   `yaml:"baseURL"`
-	StatsigMode         string   `yaml:"-"`
-	StatsigManualValue  string   `yaml:"-"`
-	StatsigSignerURL    string   `yaml:"-"`
-	ClearanceMode       string   `yaml:"-"`
-	FlareSolverrURL     string   `yaml:"-"`
-	ClearanceTimeout    Duration `yaml:"-"`
-	ClearanceRefresh    Duration `yaml:"-"`
-	QuotaTimeout        Duration `yaml:"quotaTimeout"`
-	ChatTimeout         Duration `yaml:"chatTimeout"`
-	ImageTimeout        Duration `yaml:"imageTimeout"`
-	VideoTimeout        Duration `yaml:"videoTimeout"`
-	MediaConcurrency    int      `yaml:"mediaConcurrency"`
-	AllowNSFW           bool     `yaml:"allowNSFW"`
-	RecoveryBackoffBase Duration `yaml:"recoveryBackoffBase"`
-	RecoveryBackoffMax  Duration `yaml:"recoveryBackoffMax"`
+	BaseURL                     string   `yaml:"baseURL"`
+	StatsigMode                 string   `yaml:"-"`
+	StatsigManualValue          string   `yaml:"-"`
+	StatsigSignerURL            string   `yaml:"-"`
+	ClearanceMode               string   `yaml:"-"`
+	FlareSolverrURL             string   `yaml:"-"`
+	ClearanceTimeout            Duration `yaml:"-"`
+	ClearanceRefresh            Duration `yaml:"-"`
+	QuotaTimeout                Duration `yaml:"quotaTimeout"`
+	ChatTimeout                 Duration `yaml:"chatTimeout"`
+	ImageTimeout                Duration `yaml:"imageTimeout"`
+	VideoTimeout                Duration `yaml:"videoTimeout"`
+	MediaConcurrency            int      `yaml:"mediaConcurrency"`
+	AllowNSFW                   bool     `yaml:"allowNSFW"`
+	EnableBasicImageEditViaChat bool     `yaml:"enableBasicImageEditViaChat"`
+	RecoveryBackoffBase         Duration `yaml:"recoveryBackoffBase"`
+	RecoveryBackoffMax          Duration `yaml:"recoveryBackoffMax"`
 }
 
 type ConsoleProviderConfig struct {

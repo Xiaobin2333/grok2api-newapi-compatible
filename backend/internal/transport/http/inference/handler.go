@@ -1602,9 +1602,9 @@ func (i *responseInspector) observeTerminal(data []byte) {
 		}
 	case streamProtocolImage:
 		switch payload.Type {
-		case "image_generation.completed":
+		case "image_generation.completed", "image_edit.completed":
 			i.terminalSuccess = true
-		case "image_generation.failed", "error":
+		case "image_generation.failed", "image_edit.failed", "error":
 			i.markTerminalFailure(data)
 		}
 	}

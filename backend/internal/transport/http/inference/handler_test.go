@@ -987,7 +987,9 @@ func TestCopyStreamRequiresProtocolTerminalEvent(t *testing.T) {
 		{name: "chat error", protocol: streamProtocolChat, body: `data: {"type":"error","error":{"code":"server_error","message":"chat failed"}}` + "\n\n", wantErr: errUpstreamStreamFailed, wantDiagnostic: true},
 		{name: "anthropic stop", protocol: streamProtocolAnthropic, body: `data: {"type":"message_stop"}` + "\n\n"},
 		{name: "anthropic error", protocol: streamProtocolAnthropic, body: `data: {"type":"error","error":{"type":"api_error","message":"messages failed"}}` + "\n\n", wantErr: errUpstreamStreamFailed, wantDiagnostic: true},
-		{name: "image completed", protocol: streamProtocolImage, body: `data: {"type":"image_generation.completed"}` + "\n\n"},
+		{name: "image generation completed", protocol: streamProtocolImage, body: `data: {"type":"image_generation.completed"}` + "\n\n"},
+		{name: "image edit completed", protocol: streamProtocolImage, body: `event: image_edit.completed` + "\n" + `data: {"type":"image_edit.completed"}` + "\n\n"},
+		{name: "image edit failed", protocol: streamProtocolImage, body: `data: {"type":"image_edit.failed","error":{"code":"image_edit_failed","message":"edit failed"}}` + "\n\n", wantErr: errUpstreamStreamFailed, wantDiagnostic: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

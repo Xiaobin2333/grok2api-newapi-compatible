@@ -730,6 +730,15 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 		return invalidImageRequest(err.Error())
 	}
 	cfg := a.config()
+	if basicWebTier(request.Credential.WebTier) {
+		if !cfg.EnableBasicImageEditViaChat {
+			return jsonProviderResponse(http.StatusServiceUnavailable, map[string]any{"error": map[string]any{
+				"message": "Free/Basic Chat 图片编辑未启用",
+				"type":    "server_error", "code": "upstream_unavailable",
+			}}), nil
+		}
+		return a.editBasicImageViaChat(ctx, request, format, ratio, cfg)
+	}
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
 	if err != nil {
 		return nil, err
@@ -811,6 +820,176 @@ func (a *Adapter) EditImage(ctx context.Context, request provider.ImageEditReque
 		result.QuotaUnits = 1
 	}
 	return result, err
+}
+
+func basicWebTier(tier account.WebTier) bool {
+	return tier == "" || tier == account.WebTierAuto || tier == account.WebTierBasic
+}
+
+func (a *Adapter) editBasicImageViaChat(ctx context.Context, request provider.ImageEditRequest, format, ratio string, cfg Config) (*provider.Response, error) {
+	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := a.egress.AcquireCredential(ctx, domainegress.ScopeWeb, request.Credential)
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Release()
+
+	images := make([]provider.ImageInput, 0, len(request.ImageURLs))
+	for _, rawURL := range request.ImageURLs {
+		image, loadErr := a.loadChatImage(ctx, lease, rawURL, cfg.MaxInputImageBytes)
+		if loadErr != nil {
+			return invalidImageRequest(loadErr.Error())
+		}
+		images = append(images, image)
+	}
+	if strings.TrimSpace(request.AspectRatio) != "" {
+		request.ImageURLs, images, request.Prompt = reorderLocalImageReferences(request.ImageURLs, images, request.Prompt, ratio)
+	}
+
+	attachments := make([]string, 0, len(images))
+	directUploadAvailable := true
+	for _, image := range images {
+		uploaded, directAvailable, uploadErr := a.uploadFileWithFallback(ctx, cfg, lease, token, image, cfg.BaseURL+"/", "", directUploadAvailable)
+		directUploadAvailable = directAvailable
+		if uploadErr != nil {
+			return nil, uploadErr
+		}
+		if uploaded.ID == "" {
+			return nil, fmt.Errorf("上传对话图片成功但上游未返回 fileMetadataId")
+		}
+		attachments = append(attachments, uploaded.ID)
+	}
+
+	payload := buildWebChatPayload(basicImageEditPrompt(request.Prompt, ratio), "fast", attachments)
+	response, err := a.postJSONWithReferer(
+		ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload,
+		time.Duration(cfg.ImageTimeoutSeconds)*time.Second, cfg.BaseURL+"/",
+	)
+	if err != nil {
+		return nil, err
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+		_ = response.Body.Close()
+		return &provider.Response{StatusCode: response.StatusCode, Status: response.Status, Header: jsonHeaders(), Body: io.NopCloser(bytes.NewReader(body)), QuotaMode: "fast"}, nil
+	}
+	defer response.Body.Close()
+	capture := &boundedCapture{limit: 8 << 20}
+	parsed, consumeErr := consumeUpstream(io.TeeReader(response.Body, capture), nil)
+	if consumeErr != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var result *provider.Response
+		switch {
+		case errors.Is(consumeErr, errWebUsageLimit):
+			result = jsonProviderResponse(http.StatusTooManyRequests, map[string]any{"error": map[string]any{
+				"message": "Grok Imagine 速率限制中，请稍后重试",
+				"type":    "rate_limit_error", "code": "usage_limit_reached",
+			}})
+		case errors.Is(consumeErr, errWebAntiBot):
+			result = antiBotProviderResponse()
+		default:
+			result = jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
+				"message": "Free 对话生图响应解析失败",
+				"type":    "server_error", "code": "image_edit_incomplete",
+			}})
+		}
+		result.QuotaMode = "fast"
+		return result, nil
+	}
+	urls := imageEditResultURLs(&parsed, capture.Bytes())
+	if len(urls) == 0 {
+		result := jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
+			"message": "Free 对话生图未返回可用的编辑图片",
+			"type":    "server_error", "code": "image_edit_incomplete",
+		}})
+		result.QuotaMode = "fast"
+		return result, nil
+	}
+	if request.Streaming {
+		return a.bufferedBasicImageEditStream(ctx, request.Credential, capture.Bytes(), urls[0], request.PartialImages, request.Size, ratio)
+	}
+	result, err := a.imageResponse(ctx, request.Credential, urls, nil, 1, format)
+	if result != nil {
+		result.QuotaUnits = 1
+		result.QuotaMode = "fast"
+	}
+	return result, err
+}
+
+func (a *Adapter) bufferedBasicImageEditStream(
+	ctx context.Context,
+	credential account.Credential,
+	captured []byte,
+	finalURL string,
+	partialImages int,
+	size string,
+	aspectRatio string,
+) (*provider.Response, error) {
+	createdAt := time.Now().Unix()
+	var body bytes.Buffer
+	for index, rawURL := range bufferedImageEditPartialURLs(captured, partialImages) {
+		raw, err := a.imageBytes(ctx, credential, imagineImageValue{URL: rawURL})
+		if err != nil {
+			continue
+		}
+		if err := writeSSE(&body, "image_edit.partial_image", openAIImageEditStreamEvent(
+			"image_edit.partial_image", raw, createdAt, imageEditEventSize(size, aspectRatio), index,
+		)); err != nil {
+			return nil, err
+		}
+	}
+	finalImage, err := a.imageBytes(ctx, credential, imagineImageValue{URL: finalURL})
+	if err != nil {
+		return nil, provider.NewMediaPostProcessingError(provider.MediaPostProcessingDownload, err)
+	}
+	if err := a.saveStreamImage(ctx, finalImage); err != nil {
+		return nil, err
+	}
+	if err := writeSSE(&body, "image_edit.completed", openAIImageEditStreamEvent(
+		"image_edit.completed", finalImage, createdAt, imageEditEventSize(size, aspectRatio), 0,
+	)); err != nil {
+		return nil, err
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: streamHeaders(),
+		Body: io.NopCloser(bytes.NewReader(body.Bytes())), QuotaUnits: 1, QuotaMode: "fast",
+	}, nil
+}
+
+func bufferedImageEditPartialURLs(captured []byte, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	values := make([]string, 0, limit)
+	_ = consumeJSONObjects(bytes.NewReader(captured), 8<<20, func(data []byte) error {
+		frame, ok := parseImageEditStreamFrame(data)
+		if !ok || frame.Moderated || frame.Progress >= 100 || containsString(values, frame.URL) {
+			return nil
+		}
+		values = append(values, frame.URL)
+		if len(values) >= limit {
+			return io.EOF
+		}
+		return nil
+	})
+	return values
+}
+
+func basicImageEditPrompt(prompt, ratio string) string {
+	prompt = strings.TrimSpace(prompt)
+	message := "Drawing: Edit the attached reference image"
+	if prompt != "" {
+		message += " according to these instructions: " + prompt
+	}
+	if strings.TrimSpace(ratio) != "" {
+		message += ". Create the final image with aspect ratio " + ratio
+	}
+	return message + ". Return the generated image only, not a textual description."
 }
 
 func reorderLocalImageReferences(rawURLs []string, images []provider.ImageInput, prompt, aspectRatio string) ([]string, []provider.ImageInput, string) {
