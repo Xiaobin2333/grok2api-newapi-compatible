@@ -209,9 +209,10 @@ func swaggerGenerateImage() {}
 // @Summary 编辑图片
 // @Description 接受 grok-imagine-image 或 grok-imagine-image-edit；前者会在渠道选择、计费和审计前规范为 grok-imagine-image-edit。请求必须提供至少一张参考图。
 // @Description image 接受 URL 字符串或 {"url":"..."} 对象；images 接受二者混合数组；image_urls 接受 URL 字符串数组。多字段按请求中出现顺序合并、去重。
+// @Description 同时接受 OpenAI SDK 使用的 multipart/form-data；image、image[]、images 或 images[] 可上传图片文件，image_urls 可继续提供 URL。mask 当前不支持。
 // @Tags Images
 // @Security BearerAuth
-// @Accept json
+// @Accept json,mpfd
 // @Produce json
 // @Param request body SwaggerImageEditRequest true "请求"
 // @Success 200 {object} map[string]any

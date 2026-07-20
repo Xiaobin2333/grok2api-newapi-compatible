@@ -3,11 +3,13 @@ package inference
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -41,17 +43,19 @@ type imageGateway interface {
 }
 
 const (
-	responseCopyBufferBytes         = 32 << 10
-	openAIVideoMultipartMemory      = 1 << 20
-	openAIVideoReferenceMaxBytes    = int64(32 << 20)
-	maxJSONMetadataInspectionBytes  = 8 << 20
-	maxStreamEventInspectionBytes   = 8 << 20
-	maxStreamFailureDiagnosticBytes = 64 << 10
-	maxCredentialErrorInspectBytes  = 64 << 10
-	maxJSONResponseTransferBytes    = 128 << 20
-	maxStreamResponseTransferBytes  = 256 << 20
-	maxMediaResponseTransferBytes   = int64(2) << 30
-	responseWriteTimeout            = 30 * time.Second
+	responseCopyBufferBytes          = 32 << 10
+	openAIImageEditMultipartMemory   = 1 << 20
+	openAIImageEditReferenceMaxBytes = int64(32 << 20)
+	openAIVideoMultipartMemory       = 1 << 20
+	openAIVideoReferenceMaxBytes     = int64(32 << 20)
+	maxJSONMetadataInspectionBytes   = 8 << 20
+	maxStreamEventInspectionBytes    = 8 << 20
+	maxStreamFailureDiagnosticBytes  = 64 << 10
+	maxCredentialErrorInspectBytes   = 64 << 10
+	maxJSONResponseTransferBytes     = 128 << 20
+	maxStreamResponseTransferBytes   = 256 << 20
+	maxMediaResponseTransferBytes    = int64(2) << 30
+	responseWriteTimeout             = 30 * time.Second
 )
 
 var (
@@ -59,6 +63,7 @@ var (
 	errUpstreamStreamIncomplete = errors.New("上游流在终止事件前结束")
 	errUpstreamStreamFailed     = errors.New("上游流返回失败终止事件")
 	errUpstreamStreamRead       = errors.New("读取上游流失败")
+	errImageEditMaskUnsupported = errors.New("当前 Grok Web 图片编辑不支持 mask")
 )
 
 type streamProtocol uint8
@@ -705,19 +710,37 @@ func copyMedia(writer io.Writer, source io.Reader, limit int64) error {
 
 func (h *Handler) editImage(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, h.maxBodyBytes)
-	if !isJSONRequest(c) {
-		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json")
+	mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
+	if err != nil || (!strings.EqualFold(mediaType, "application/json") && !strings.EqualFold(mediaType, "multipart/form-data")) {
+		writeOpenAIError(c, http.StatusUnsupportedMediaType, "invalid_request", "图片编辑仅支持 application/json 或 multipart/form-data")
 		return
 	}
 	var request imageEditJSONRequest
-	payload, err := decodeImageJSONRequest(c.Request.Body, &request)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑 JSON 请求无效")
-		return
+	var imageURLs []string
+	if strings.EqualFold(mediaType, "multipart/form-data") {
+		request, imageURLs, err = parseImageEditMultipart(c, h.maxBodyBytes)
+	} else {
+		var payload []byte
+		payload, err = decodeImageJSONRequest(c.Request.Body, &request)
+		if err == nil {
+			var referenceErr *imageRequestError
+			imageURLs, referenceErr = parseImageReferences(payload)
+			if referenceErr != nil {
+				writeOpenAIError(c, http.StatusBadRequest, referenceErr.Code, referenceErr.Message)
+				return
+			}
+		}
 	}
-	imageURLs, referenceErr := parseImageReferences(payload)
-	if referenceErr != nil {
-		writeOpenAIError(c, http.StatusBadRequest, referenceErr.Code, referenceErr.Message)
+	if err != nil {
+		var maxBytesError *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxBytesError):
+			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "图片编辑参考图超过请求大小限制")
+		case errors.Is(err, errImageEditMaskUnsupported):
+			writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", err.Error())
+		default:
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑请求无效: "+err.Error())
+		}
 		return
 	}
 	if value := bytes.TrimSpace(request.StorageOptions); len(value) > 0 && !bytes.Equal(value, []byte("null")) {
@@ -760,6 +783,135 @@ func (h *Handler) editImage(c *gin.Context) {
 		return
 	}
 	h.writeResult(c, result, request.Stream, streamProtocolImage)
+}
+
+func parseImageEditMultipart(c *gin.Context, maxBodyBytes int64) (imageEditJSONRequest, []string, error) {
+	memoryBytes := min(maxBodyBytes, int64(openAIImageEditMultipartMemory))
+	if err := c.Request.ParseMultipartForm(memoryBytes); err != nil {
+		return imageEditJSONRequest{}, nil, err
+	}
+	form := c.Request.MultipartForm
+	defer form.RemoveAll()
+	if len(form.File["mask"]) > 0 || strings.TrimSpace(firstMultipartValue(form, "mask")) != "" {
+		return imageEditJSONRequest{}, nil, errImageEditMaskUnsupported
+	}
+	request := imageEditJSONRequest{
+		Model: strings.TrimSpace(firstMultipartValue(form, "model")), Prompt: strings.TrimSpace(firstMultipartValue(form, "prompt")),
+		Size: strings.TrimSpace(firstMultipartValue(form, "size")), AspectRatio: strings.TrimSpace(firstMultipartValue(form, "aspect_ratio")),
+		Resolution: strings.TrimSpace(firstMultipartValue(form, "resolution")), ResponseFormat: strings.TrimSpace(firstMultipartValue(form, "response_format")),
+	}
+	var err error
+	if request.Count, err = optionalMultipartInt(form, "n"); err != nil {
+		return imageEditJSONRequest{}, nil, err
+	}
+	if request.PartialImages, err = optionalMultipartInt(form, "partial_images"); err != nil {
+		return imageEditJSONRequest{}, nil, err
+	}
+	if request.Stream, err = optionalMultipartBool(form, "stream"); err != nil {
+		return imageEditJSONRequest{}, nil, err
+	}
+	if value := strings.TrimSpace(firstMultipartValue(form, "storage_options")); value != "" {
+		request.StorageOptions = json.RawMessage(value)
+	}
+
+	references := make([]string, 0, 8)
+	seen := make(map[string]struct{}, 8)
+	appendReference := func(value string) error {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return errors.New("参考图字段为空")
+		}
+		if _, exists := seen[value]; exists {
+			return nil
+		}
+		if len(references) >= 8 {
+			return errors.New("image 或 images（以及 image_urls）数量必须在 1 到 8 之间")
+		}
+		seen[value] = struct{}{}
+		references = append(references, value)
+		return nil
+	}
+	for _, field := range []string{"image", "image[]", "images", "images[]"} {
+		for _, value := range form.Value[field] {
+			if err := appendReference(value); err != nil {
+				return imageEditJSONRequest{}, nil, err
+			}
+		}
+		for _, header := range form.File[field] {
+			value, err := multipartImageDataURI(header, maxBodyBytes)
+			if err != nil {
+				return imageEditJSONRequest{}, nil, err
+			}
+			if err := appendReference(value); err != nil {
+				return imageEditJSONRequest{}, nil, err
+			}
+		}
+	}
+	for _, field := range []string{"image_urls", "image_urls[]"} {
+		for _, value := range form.Value[field] {
+			if err := appendReference(value); err != nil {
+				return imageEditJSONRequest{}, nil, err
+			}
+		}
+	}
+	return request, references, nil
+}
+
+func firstMultipartValue(form *multipart.Form, field string) string {
+	if values := form.Value[field]; len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+func optionalMultipartInt(form *multipart.Form, field string) (*int, error) {
+	value := strings.TrimSpace(firstMultipartValue(form, field))
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s 必须是整数", field)
+	}
+	return &parsed, nil
+}
+
+func optionalMultipartBool(form *multipart.Form, field string) (bool, error) {
+	value := strings.TrimSpace(firstMultipartValue(form, field))
+	if value == "" {
+		return false, nil
+	}
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s 必须是布尔值", field)
+	}
+	return parsed, nil
+}
+
+func multipartImageDataURI(header *multipart.FileHeader, maxBodyBytes int64) (string, error) {
+	file, err := header.Open()
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	fileLimit := min(maxBodyBytes, openAIImageEditReferenceMaxBytes)
+	raw, err := io.ReadAll(io.LimitReader(file, fileLimit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(raw)) > fileLimit {
+		return "", &http.MaxBytesError{Limit: fileLimit}
+	}
+	mimeType := strings.TrimSpace(strings.Split(http.DetectContentType(raw), ";")[0])
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return "", errors.New("上传文件必须是图片")
+	}
+	switch strings.ToLower(mimeType) {
+	case "image/jpeg", "image/png", "image/webp", "image/gif":
+	default:
+		return "", errors.New("图片格式必须是 JPEG、PNG、WebP 或 GIF")
+	}
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(raw), nil
 }
 
 func requestIdentity(c *gin.Context) (clientkeydomain.Key, string, bool) {

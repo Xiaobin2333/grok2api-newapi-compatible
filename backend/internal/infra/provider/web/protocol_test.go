@@ -881,10 +881,18 @@ func TestReorderImageReferencesUsesAlreadyLoadedExternalDimensions(t *testing.T)
 }
 
 func TestBuildBasicImageEditPayloadKeepsMultiReferenceSemantics(t *testing.T) {
-	payload := buildBasicImageEditPayload("图片1是角色，图片2是场景", "9:16", 2, []string{"file_1", "file_2"})
+	references := []provider.ImageInput{
+		{MIMEType: "image/png", Data: testPNG(t, 600, 900)},
+		{MIMEType: "image/png", Data: testPNG(t, 1600, 900)},
+	}
+	payload := buildBasicImageEditPayload("图片1是角色，图片2是场景", "9:16", references, []string{"file_1", "file_2"})
 	message, _ := payload["message"].(string)
-	if !strings.Contains(message, "all 2 attached reference images") || !strings.Contains(message, "do not swap or merge their roles") || !strings.Contains(message, "图片1是角色，图片2是场景") {
+	if !strings.Contains(message, "all 2 attached reference images") || !strings.Contains(message, "do not swap or merge their roles") || !strings.Contains(message, "equally authoritative") || !strings.Contains(message, "image 1 is portrait (600x900)") || !strings.Contains(message, "image 2 is landscape (1600x900)") || !strings.Contains(message, "图片1是角色，图片2是场景") {
 		t.Fatalf("message=%q", message)
+	}
+	personality, _ := payload["customPersonality"].(string)
+	if !strings.Contains(personality, "precision image editor") || !strings.Contains(personality, "authoritative visual reference") {
+		t.Fatalf("customPersonality=%q", personality)
 	}
 	metadata := payload["responseMetadata"].(map[string]any)
 	override := metadata["modelConfigOverride"].(map[string]any)

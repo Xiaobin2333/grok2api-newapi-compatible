@@ -510,6 +510,15 @@ func makeVideoTestPNG(t *testing.T, minimumBytes int) []byte {
 	return encoded.Bytes()
 }
 
+func testPNGBytes(t *testing.T, width, height int) []byte {
+	t.Helper()
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewGray(image.Rect(0, 0, width, height))); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
+}
+
 func TestVideoGenerationResponseKeepsNativePollingShape(t *testing.T) {
 	pending := videoGenerationResponse(mediadomain.Job{Model: "grok-imagine-video", Status: mediadomain.StatusInProgress, Progress: 42})
 	if pending["status"] != "pending" || pending["progress"] != 42 || pending["model"] != "grok-imagine-video" {
@@ -812,12 +821,97 @@ func TestImageEditAcceptsOfficialJSONShape(t *testing.T) {
 		})
 	}
 
-	multipartRequest := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader("ignored"))
-	multipartRequest.Header.Set("Content-Type", "multipart/form-data; boundary=test")
-	multipartRecorder := httptest.NewRecorder()
-	router.ServeHTTP(multipartRecorder, multipartRequest)
-	if multipartRecorder.Code != http.StatusUnsupportedMediaType || !strings.Contains(multipartRecorder.Body.String(), "application/json") {
-		t.Fatalf("multipart status=%d body=%s", multipartRecorder.Code, multipartRecorder.Body.String())
+	unsupportedRequest := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader("ignored"))
+	unsupportedRequest.Header.Set("Content-Type", "text/plain")
+	unsupportedRecorder := httptest.NewRecorder()
+	router.ServeHTTP(unsupportedRecorder, unsupportedRequest)
+	if unsupportedRecorder.Code != http.StatusUnsupportedMediaType || !strings.Contains(unsupportedRecorder.Body.String(), "multipart/form-data") {
+		t.Fatalf("unsupported status=%d body=%s", unsupportedRecorder.Code, unsupportedRecorder.Body.String())
+	}
+}
+
+func TestImageEditAcceptsOpenAIMultipartFileUpload(t *testing.T) {
+	images := &recordingImageGateway{}
+	router := imageHandlerTestRouter(images)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for field, value := range map[string]string{
+		"model": "grok-imagine-image", "prompt": "保持角色，改为夜景", "n": "1",
+		"size": "1536x1024", "aspect_ratio": "16:9", "resolution": "1k", "response_format": "b64_json",
+	} {
+		if err := writer.WriteField(field, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	part, err := writer.CreateFormFile("image", "character.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(testPNGBytes(t, 600, 900)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("image_urls", "https://example.com/scene.png"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"b64_json":"aW1hZ2U="`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(images.editInputs) != 1 {
+		t.Fatalf("edit inputs=%#v", images.editInputs)
+	}
+	input := images.editInputs[0]
+	if input.RequestedModel != "grok-imagine-image" || input.EffectiveModel != "grok-imagine-image-edit" || !input.AutoRouted || input.Count != 1 || input.Size != "1536x1024" || input.AspectRatio != "16:9" || input.Resolution != "1k" || input.ResponseFormat != "b64_json" {
+		t.Fatalf("input=%#v", input)
+	}
+	if len(input.ImageURLs) != 2 || !strings.HasPrefix(input.ImageURLs[0], "data:image/png;base64,") || input.ImageURLs[1] != "https://example.com/scene.png" {
+		t.Fatalf("image URLs=%#v", input.ImageURLs)
+	}
+}
+
+func TestImageEditMultipartRejectsNonImageAndMask(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		field     string
+		filename  string
+		content   []byte
+		wantCode  string
+		wantError string
+	}{
+		{name: "non image", field: "image", filename: "reference.txt", content: []byte("not an image"), wantCode: "invalid_request", wantError: "必须是图片"},
+		{name: "mask", field: "mask", filename: "mask.png", content: testPNGBytes(t, 1, 1), wantCode: "unsupported_parameter", wantError: "不支持 mask"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router := imageHandlerTestRouter(&recordingImageGateway{})
+			var body bytes.Buffer
+			writer := multipart.NewWriter(&body)
+			_ = writer.WriteField("model", "grok-imagine-image")
+			_ = writer.WriteField("prompt", "edit")
+			part, err := writer.CreateFormFile(test.field, test.filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := part.Write(test.content); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+			request.Header.Set("Content-Type", writer.FormDataContentType())
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), test.wantCode) || !strings.Contains(recorder.Body.String(), test.wantError) {
+				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }
 

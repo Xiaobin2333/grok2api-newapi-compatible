@@ -859,7 +859,7 @@ func (a *Adapter) editBasicImageViaChat(ctx context.Context, request provider.Im
 		attachments = append(attachments, uploaded.ID)
 	}
 
-	payload := buildBasicImageEditPayload(request.Prompt, ratio, len(attachments), attachments)
+	payload := buildBasicImageEditPayload(request.Prompt, ratio, images, attachments)
 	response, err := a.postJSONWithReferer(
 		ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload,
 		time.Duration(cfg.ImageTimeoutSeconds)*time.Second, cfg.BaseURL+"/",
@@ -976,12 +976,13 @@ func bufferedImageEditPartialURLs(captured []byte, limit int) []string {
 	return values
 }
 
-func buildBasicImageEditPayload(prompt, ratio string, referenceCount int, attachments []string) map[string]any {
-	payload := buildWebChatPayload(basicImageEditPrompt(prompt, ratio, referenceCount), "fast", attachments)
+func buildBasicImageEditPayload(prompt, ratio string, references []provider.ImageInput, attachments []string) map[string]any {
+	payload := buildWebChatPayload(basicImageEditPrompt(prompt, ratio, references), "fast", attachments)
 	payload["disableSearch"] = true
 	payload["disableTextFollowUps"] = true
 	payload["imageGenerationCount"] = 1
 	payload["toolOverrides"] = map[string]any{"imageGen": true}
+	payload["customPersonality"] = "Act as a precision image editor. Treat every attached image as an authoritative visual reference, preserve identity and all untouched details, and obey the numbered reference roles in the edit instructions. Produce an image rather than describing one."
 	if _, ok := numericAspectRatio(ratio); ok {
 		payload["responseMetadata"] = map[string]any{"modelConfigOverride": map[string]any{"modelMap": map[string]any{
 			"imageGenModelConfig": map[string]any{"aspectRatio": ratio},
@@ -990,15 +991,20 @@ func buildBasicImageEditPayload(prompt, ratio string, referenceCount int, attach
 	return payload
 }
 
-func basicImageEditPrompt(prompt, ratio string, referenceCount int) string {
+func basicImageEditPrompt(prompt, ratio string, references []provider.ImageInput) string {
 	prompt = strings.TrimSpace(prompt)
+	referenceCount := len(references)
 	message := "Drawing: Perform a faithful image edit using the attached reference image as the visual source of truth"
 	if referenceCount > 1 {
 		message = fmt.Sprintf("Drawing: Perform a faithful image edit using all %d attached reference images, numbered image 1 through image %d in attachment order", referenceCount, referenceCount)
 		message += ". Keep each numbered reference's requested role (character, scene, object, or style) distinct; do not swap or merge their roles"
+		message += ". The first attachment anchors canvas orientation only; all numbered references remain equally authoritative for their assigned semantic roles"
 	}
 	message += ". Preserve identity-defining facial features, body shape, pose, composition, clothing, objects, colors, lighting, and art style unless the edit instructions explicitly change them"
 	message += ". Apply only the requested changes and keep every other visible detail consistent"
+	if layout := basicImageReferenceLayout(references); layout != "" {
+		message += ". Reference geometry: " + layout
+	}
 	if prompt != "" {
 		message += ". Edit instructions: " + prompt
 	}
@@ -1006,6 +1012,25 @@ func basicImageEditPrompt(prompt, ratio string, referenceCount int) string {
 		message += ". The final canvas must use aspect ratio " + ratio + "; extend or recompose the background instead of distorting the referenced subjects"
 	}
 	return message + ". Return exactly one edited image and no textual description."
+}
+
+func basicImageReferenceLayout(references []provider.ImageInput) string {
+	values := make([]string, 0, len(references))
+	for index, reference := range references {
+		width, height, ok := referenceImageDimensions(reference)
+		if !ok {
+			continue
+		}
+		orientation := "square"
+		switch {
+		case width > height:
+			orientation = "landscape"
+		case width < height:
+			orientation = "portrait"
+		}
+		values = append(values, fmt.Sprintf("image %d is %s (%dx%d)", index+1, orientation, width, height))
+	}
+	return strings.Join(values, "; ")
 }
 
 func reorderImageReferencesByAspectRatio(rawURLs []string, images []provider.ImageInput, prompt, aspectRatio string) ([]string, []provider.ImageInput, string) {
