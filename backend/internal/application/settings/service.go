@@ -90,12 +90,14 @@ type FrontendConfig struct {
 
 // RoutingConfig 是管理接口使用的路由可编辑输入。
 type RoutingConfig struct {
-	StickyTTL       string
-	CooldownBase    string
-	CooldownMax     string
-	CapacityWait    string
-	MaxAttempts     int
-	PreferFreeBuild bool
+	StickyTTL                   string
+	CooldownBase                string
+	CooldownMax                 string
+	CapacityWait                string
+	MaxAttempts                 int
+	FreeAccountMaxConcurrent    int
+	VideoPremiumAccountAttempts int
+	PreferFreeBuild             bool
 }
 
 // AuditConfig 是管理接口使用的审计可编辑输入。
@@ -332,9 +334,14 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Routing = config.RoutingConfig{
 		StickyTTL: config.Duration(value.Routing.StickyTTL), CooldownBase: config.Duration(value.Routing.CooldownBase),
 		CooldownMax: config.Duration(value.Routing.CooldownMax), CapacityWait: config.Duration(capacityWait), MaxAttempts: value.Routing.MaxAttempts,
-		PreferFreeBuild:        value.Routing.PreferFreeBuild,
-		ReasoningReplayEnabled: base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
+		FreeAccountMaxConcurrent:    value.Routing.FreeAccountMaxConcurrent,
+		VideoPremiumAccountAttempts: value.Routing.VideoPremiumAccountAttempts,
+		PreferFreeBuild:             value.Routing.PreferFreeBuild,
+		ReasoningReplayEnabled:      base.Routing.ReasoningReplayEnabled, ReasoningReplayTTL: base.Routing.ReasoningReplayTTL,
 		ReasoningReplayMaxEntries: base.Routing.ReasoningReplayMaxEntries,
+	}
+	if base.Routing.VideoPremiumAccountAttempts < 1 {
+		base.Routing.VideoPremiumAccountAttempts = 2
 	}
 	base.Audit = config.AuditConfig{
 		BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: config.Duration(value.Audit.FlushInterval),
@@ -392,7 +399,9 @@ func toDomainConfig(value config.Config) settingsdomain.Config {
 		Routing: settingsdomain.RoutingConfig{
 			StickyTTL: value.Routing.StickyTTL.Value(), CooldownBase: value.Routing.CooldownBase.Value(),
 			CooldownMax: value.Routing.CooldownMax.Value(), CapacityWait: value.Routing.CapacityWait.Value(), MaxAttempts: value.Routing.MaxAttempts,
-			PreferFreeBuild: value.Routing.PreferFreeBuild,
+			FreeAccountMaxConcurrent:    value.Routing.FreeAccountMaxConcurrent,
+			VideoPremiumAccountAttempts: value.Routing.VideoPremiumAccountAttempts,
+			PreferFreeBuild:             value.Routing.PreferFreeBuild,
 		},
 		Audit: settingsdomain.AuditConfig{
 			BufferSize: value.Audit.BufferSize, BatchSize: value.Audit.BatchSize, FlushInterval: value.Audit.FlushInterval.Value(),
@@ -464,6 +473,10 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Media.CleanupThresholdPercent = input.Media.CleanupThresholdPercent
 	next.Frontend.PublicAPIBaseURLOverride = strings.TrimSpace(input.Frontend.PublicAPIBaseURL)
 	next.Routing.MaxAttempts = input.Routing.MaxAttempts
+	next.Routing.FreeAccountMaxConcurrent = input.Routing.FreeAccountMaxConcurrent
+	if input.Routing.VideoPremiumAccountAttempts != 0 {
+		next.Routing.VideoPremiumAccountAttempts = input.Routing.VideoPremiumAccountAttempts
+	}
 	next.Routing.PreferFreeBuild = input.Routing.PreferFreeBuild
 	next.Audit.BufferSize = input.Audit.BufferSize
 	next.Audit.BatchSize = input.Audit.BatchSize
@@ -557,7 +570,9 @@ func toEditable(cfg config.Config) EditableConfig {
 		Routing: RoutingConfig{
 			StickyTTL: cfg.Routing.StickyTTL.String(), CooldownBase: cfg.Routing.CooldownBase.String(),
 			CooldownMax: cfg.Routing.CooldownMax.String(), CapacityWait: cfg.Routing.CapacityWait.String(), MaxAttempts: cfg.Routing.MaxAttempts,
-			PreferFreeBuild: cfg.Routing.PreferFreeBuild,
+			FreeAccountMaxConcurrent:    cfg.Routing.FreeAccountMaxConcurrent,
+			VideoPremiumAccountAttempts: cfg.Routing.VideoPremiumAccountAttempts,
+			PreferFreeBuild:             cfg.Routing.PreferFreeBuild,
 		},
 		Audit: AuditConfig{
 			BufferSize: cfg.Audit.BufferSize, BatchSize: cfg.Audit.BatchSize, FlushInterval: cfg.Audit.FlushInterval.String(),

@@ -68,6 +68,30 @@ func (r *failureAttemptRecorder) captureCredentialFailure(credential accountdoma
 	})
 }
 
+func (r *failureAttemptRecorder) captureProviderFailure(credential accountdomain.Credential, startedAt time.Time, stage string, err error) {
+	if err == nil {
+		return
+	}
+	attempt := audit.Attempt{
+		Source:         audit.AttemptSourceTransport,
+		Stage:          stage,
+		AccountID:      auditAccountID(credential.ID),
+		AccountName:    credential.Name,
+		Method:         r.method,
+		RequestPath:    r.path,
+		StartedAt:      startedAt.UTC(),
+		DurationMS:     time.Since(startedAt).Milliseconds(),
+		TransportError: sanitizeDiagnosticText(err.Error(), diagnosticTextLimit),
+		ErrorChain:     errorFrames(err),
+	}
+	if status, ok := provider.ErrorHTTPStatus(err); ok {
+		attempt.Source = audit.AttemptSourceUpstreamHTTP
+		attempt.UpstreamStatusCode = &status
+		attempt.UpstreamStatus = http.StatusText(status)
+	}
+	r.append(attempt)
+}
+
 func (r *failureAttemptRecorder) captureResponse(credential accountdomain.Credential, startedAt time.Time, response *provider.Response, requestErr error) error {
 	if requestErr != nil {
 		r.append(audit.Attempt{

@@ -90,23 +90,24 @@ func (l *accountLease) Release() {
 
 // Selector 实现可替换的 balanced 账号选择策略。
 type Selector struct {
-	accounts             repository.AccountRepository
-	concurrency          repository.ConcurrencyLimiter
-	sticky               repository.StickySessionRepository
-	stickyTTL            time.Duration
-	cooldownBase         time.Duration
-	cooldownMax          time.Duration
-	capacityWait         time.Duration
-	preferFreeBuild      bool
-	mu                   sync.Mutex
-	leaseWakeMu          sync.Mutex
-	leaseWake            chan struct{}
-	lastSelectedAt       map[uint64]time.Time
-	lastSuccessAt        map[uint64]time.Time
-	candidates           map[candidateCacheKey]candidateSnapshot
-	candidateLoads       singleflight.Group
-	concurrencySnapshots *resultcache.Cache[[32]byte, map[string]int]
-	tierOrders           interface {
+	accounts                 repository.AccountRepository
+	concurrency              repository.ConcurrencyLimiter
+	sticky                   repository.StickySessionRepository
+	stickyTTL                time.Duration
+	cooldownBase             time.Duration
+	cooldownMax              time.Duration
+	capacityWait             time.Duration
+	preferFreeBuild          bool
+	freeAccountMaxConcurrent int
+	mu                       sync.Mutex
+	leaseWakeMu              sync.Mutex
+	leaseWake                chan struct{}
+	lastSelectedAt           map[uint64]time.Time
+	lastSuccessAt            map[uint64]time.Time
+	candidates               map[candidateCacheKey]candidateSnapshot
+	candidateLoads           singleflight.Group
+	concurrencySnapshots     *resultcache.Cache[[32]byte, map[string]int]
+	tierOrders               interface {
 		TierOrder(account.Provider, string) []account.WebTier
 	}
 }
@@ -136,6 +137,13 @@ func (s *Selector) UpdateConfig(stickyTTL, cooldownBase, cooldownMax time.Durati
 func (s *Selector) UpdatePreferFreeBuild(value bool) {
 	s.mu.Lock()
 	s.preferFreeBuild = value
+	s.mu.Unlock()
+}
+
+// UpdateFreeAccountMaxConcurrent 热更新已确认 Build Free 和 Web Basic 的每账号并发上限；0 沿用账号自身配置。
+func (s *Selector) UpdateFreeAccountMaxConcurrent(value int) {
+	s.mu.Lock()
+	s.freeAccountMaxConcurrent = max(0, value)
 	s.mu.Unlock()
 }
 
@@ -226,7 +234,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			return nil, err
 		}
 		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
-			lease, err := s.claimAccountSlot(ctx, candidate.Credential)
+			lease, err := s.claimAccountSlot(ctx, candidate)
 			if err != nil {
 				return nil, err
 			}
@@ -266,7 +274,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 					stickyID = boundID
 				}
 				if eligible {
-					lease, acquireErr := s.acquirePinnedCapacity(ctx, candidate.Credential)
+					lease, acquireErr := s.acquirePinnedCapacity(ctx, candidate)
 					if acquireErr == nil {
 						lease.Billing = candidate.Billing
 						lease.QuotaMode = effectiveQuotaMode(candidate, quotaMode)
@@ -291,7 +299,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			if candidate.Credential.ID == saturatedStickyID {
 				continue
 			}
-			lease, claimErr := s.claimAccountSlot(ctx, candidate.Credential)
+			lease, claimErr := s.claimAccountSlot(ctx, candidate)
 			if claimErr != nil {
 				return nil, claimErr
 			}
@@ -313,7 +321,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 			return nil, err
 		}
 		for candidate, ok := plan.Next(); ok; candidate, ok = plan.Next() {
-			lease, err := s.claimAccountSlot(ctx, candidate.Credential)
+			lease, err := s.claimAccountSlot(ctx, candidate)
 			if err != nil {
 				return nil, err
 			}
@@ -329,7 +337,7 @@ func (s *Selector) Acquire(ctx context.Context, provider account.Provider, upstr
 				}
 				if boundID != candidate.Credential.ID {
 					if boundCandidate, eligible := routingCandidateByID(values, normalCandidates, boundID); eligible {
-						boundLease, boundErr := s.acquirePinnedCapacity(ctx, boundCandidate.Credential)
+						boundLease, boundErr := s.acquirePinnedCapacity(ctx, boundCandidate)
 						if boundErr == nil {
 							lease.Release()
 							boundLease.Billing = boundCandidate.Billing
@@ -421,7 +429,7 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 					}
 					return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
 				}
-				lease, err := s.acquirePinnedCapacity(ctx, value)
+				lease, err := s.acquirePinnedCapacity(ctx, candidate)
 				if err != nil {
 					return nil, err
 				}
@@ -449,7 +457,7 @@ func (s *Selector) AcquirePinned(ctx context.Context, provider account.Provider,
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
 			}
 		}
-		lease, err := s.acquirePinnedCapacity(ctx, value)
+		lease, err := s.acquirePinnedCapacity(ctx, candidate)
 		if err != nil {
 			return nil, err
 		}
@@ -658,10 +666,17 @@ func (s *Selector) invalidateCandidates(provider account.Provider) {
 	}
 }
 
-func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credential) (*accountLease, error) {
+func (s *Selector) claimAccountSlot(ctx context.Context, candidate account.RoutingCandidate) (*accountLease, error) {
+	value := candidate.Credential
 	limit := value.MaxConcurrent
 	if limit <= 0 {
 		limit = account.DefaultMaxConcurrent
+	}
+	s.mu.Lock()
+	freeLimit := s.freeAccountMaxConcurrent
+	s.mu.Unlock()
+	if freeLimit > 0 && isKnownFreeCandidate(candidate) {
+		limit = min(limit, freeLimit)
 	}
 	release, acquired, err := s.concurrency.Acquire(ctx, accountConcurrencyKey(value.ID), limit)
 	if err != nil {
@@ -679,11 +694,16 @@ func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credentia
 	}}, nil
 }
 
-func (s *Selector) acquirePinnedCapacity(ctx context.Context, value account.Credential) (*accountLease, error) {
+func isKnownFreeCandidate(candidate account.RoutingCandidate) bool {
+	return candidate.IsKnownFreeBuild() ||
+		(candidate.Credential.Provider == account.ProviderWeb && candidate.Credential.WebTier == account.WebTierBasic)
+}
+
+func (s *Selector) acquirePinnedCapacity(ctx context.Context, candidate account.RoutingCandidate) (*accountLease, error) {
 	_, _, _, capacityWait := s.routingConfig()
 	deadline := time.Now().Add(capacityWait)
 	for {
-		lease, err := s.claimAccountSlot(ctx, value)
+		lease, err := s.claimAccountSlot(ctx, candidate)
 		if err != nil || lease != nil {
 			return lease, err
 		}

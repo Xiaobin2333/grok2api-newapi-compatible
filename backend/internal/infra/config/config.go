@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	clientkeydomain "github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/pkg/signerurl"
 	"gopkg.in/yaml.v3"
@@ -185,15 +186,17 @@ type LocalMediaConfig struct {
 }
 
 type RoutingConfig struct {
-	StickyTTL                 Duration `yaml:"stickyTTL"`
-	CooldownBase              Duration `yaml:"cooldownBase"`
-	CooldownMax               Duration `yaml:"cooldownMax"`
-	CapacityWait              Duration `yaml:"capacityWait"`
-	MaxAttempts               int      `yaml:"maxAttempts"`
-	PreferFreeBuild           bool     `yaml:"preferFreeBuild"`
-	ReasoningReplayEnabled    bool     `yaml:"reasoningReplayEnabled"`
-	ReasoningReplayTTL        Duration `yaml:"reasoningReplayTTL"`
-	ReasoningReplayMaxEntries int      `yaml:"reasoningReplayMaxEntries"`
+	StickyTTL                   Duration `yaml:"stickyTTL"`
+	CooldownBase                Duration `yaml:"cooldownBase"`
+	CooldownMax                 Duration `yaml:"cooldownMax"`
+	CapacityWait                Duration `yaml:"capacityWait"`
+	MaxAttempts                 int      `yaml:"maxAttempts"`
+	FreeAccountMaxConcurrent    int      `yaml:"freeAccountMaxConcurrent"`
+	VideoPremiumAccountAttempts int      `yaml:"videoPremiumAccountAttempts"`
+	PreferFreeBuild             bool     `yaml:"preferFreeBuild"`
+	ReasoningReplayEnabled      bool     `yaml:"reasoningReplayEnabled"`
+	ReasoningReplayTTL          Duration `yaml:"reasoningReplayTTL"`
+	ReasoningReplayMaxEntries   int      `yaml:"reasoningReplayMaxEntries"`
 }
 
 type AuditConfig struct {
@@ -477,7 +480,7 @@ func (c Config) Validate() error {
 	if c.Provider.Web.RecoveryBackoffBase.Value() < 5*time.Second || c.Provider.Web.RecoveryBackoffMax.Value() < c.Provider.Web.RecoveryBackoffBase.Value() || c.Provider.Web.RecoveryBackoffMax.Value() > 6*time.Hour {
 		return errors.New("provider.web 恢复退避配置无效")
 	}
-	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 1 || c.Routing.MaxAttempts > 10 {
+	if c.Routing.StickyTTL.Value() <= 0 || c.Routing.StickyTTL.Value() > maxRoutingTTL || c.Routing.CooldownBase.Value() <= 0 || c.Routing.CooldownMax.Value() < c.Routing.CooldownBase.Value() || c.Routing.CooldownMax.Value() > maxRoutingCooldown || c.Routing.CapacityWait.Value() <= 0 || c.Routing.CapacityWait.Value() > 5*time.Second || c.Routing.MaxAttempts < 0 || c.Routing.FreeAccountMaxConcurrent < 0 || c.Routing.FreeAccountMaxConcurrent > accountdomain.MaxConcurrent || c.Routing.VideoPremiumAccountAttempts < 1 {
 		return errors.New("routing 配置无效")
 	}
 	if c.Routing.ReasoningReplayTTL.Value() <= 0 || c.Routing.ReasoningReplayTTL.Value() > 24*time.Hour {
@@ -580,15 +583,17 @@ func defaultConfig() Config {
 			Local: LocalMediaConfig{Path: "./data/media"},
 		},
 		Routing: RoutingConfig{
-			StickyTTL:                 Duration(time.Hour),
-			CooldownBase:              Duration(30 * time.Second),
-			CooldownMax:               Duration(30 * time.Minute),
-			CapacityWait:              Duration(500 * time.Millisecond),
-			MaxAttempts:               3,
-			PreferFreeBuild:           false,
-			ReasoningReplayEnabled:    true,
-			ReasoningReplayTTL:        Duration(time.Hour),
-			ReasoningReplayMaxEntries: 10240,
+			StickyTTL:                   Duration(time.Hour),
+			CooldownBase:                Duration(30 * time.Second),
+			CooldownMax:                 Duration(30 * time.Minute),
+			CapacityWait:                Duration(500 * time.Millisecond),
+			MaxAttempts:                 3,
+			FreeAccountMaxConcurrent:    0,
+			VideoPremiumAccountAttempts: 2,
+			PreferFreeBuild:             false,
+			ReasoningReplayEnabled:      true,
+			ReasoningReplayTTL:          Duration(time.Hour),
+			ReasoningReplayMaxEntries:   10240,
 		},
 		Audit:             AuditConfig{BufferSize: 16384, BatchSize: 256, FlushInterval: Duration(250 * time.Millisecond)},
 		ClientKeyDefaults: ClientKeyDefaultsConfig{RPMLimit: clientkeydomain.DefaultRPMLimit, MaxConcurrent: clientkeydomain.DefaultMaxConcurrent},

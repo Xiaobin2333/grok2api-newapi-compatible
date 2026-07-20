@@ -143,6 +143,42 @@ routing:
 	}
 }
 
+func TestValidateAllowsUnlimitedRoutingAttempts(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Secrets.JWTSecret = "12345678901234567890123456789012"
+	cfg.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	cfg.Routing.MaxAttempts = 0
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("zero maxAttempts should poll all accounts: %v", err)
+	}
+	cfg.Routing.MaxAttempts = 1000
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("positive maxAttempts should have no configured upper bound: %v", err)
+	}
+	cfg.Routing.VideoPremiumAccountAttempts = 1000
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("positive premium video attempts should have no configured upper bound: %v", err)
+	}
+	cfg.Routing.FreeAccountMaxConcurrent = 256
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("maximum per-Free concurrency was rejected: %v", err)
+	}
+	cfg.Routing.FreeAccountMaxConcurrent = 257
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("per-Free concurrency above account limit was accepted")
+	}
+	cfg.Routing.FreeAccountMaxConcurrent = 0
+	cfg.Routing.MaxAttempts = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("negative maxAttempts was accepted")
+	}
+	cfg.Routing.MaxAttempts = 0
+	cfg.Routing.VideoPremiumAccountAttempts = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("zero premium video attempts was accepted")
+	}
+}
+
 func TestLoadRejectsMediaRuntimeSettingsInYAML(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	data := []byte(`secrets:

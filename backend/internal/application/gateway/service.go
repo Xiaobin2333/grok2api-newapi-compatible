@@ -118,27 +118,28 @@ type accountModelSyncer interface {
 
 // Service 负责模型路由、账号选择、故障切换与审计收口。
 type Service struct {
-	models         routeResolver
-	audits         auditRecorder
-	accounts       *accountapp.Service
-	clientKeys     *clientkeyapp.Service
-	providers      *provider.Registry
-	selector       *Selector
-	responses      repository.ResponseRepository
-	maxAttempts    atomic.Int64
-	mediaJobs      repository.MediaJobRepository
-	mediaAssets    videoAssetStore
-	mediaQueue     chan string
-	mediaMu        sync.Mutex
-	mediaQueued    map[string]struct{}
-	mediaWorker    int
-	mediaQueueFull atomic.Uint64
-	logger         *slog.Logger
-	rateLimitMu    sync.Mutex
-	rateLimits     map[string]teamModelRateLimit
-	rateLimitTeams map[uint64]string
-	modelSyncMu    sync.Mutex
-	modelSyncing   map[uint64]struct{}
+	models               routeResolver
+	audits               auditRecorder
+	accounts             *accountapp.Service
+	clientKeys           *clientkeyapp.Service
+	providers            *provider.Registry
+	selector             *Selector
+	responses            repository.ResponseRepository
+	maxAttempts          atomic.Int64
+	videoAccountAttempts atomic.Int64
+	mediaJobs            repository.MediaJobRepository
+	mediaAssets          videoAssetStore
+	mediaQueue           chan string
+	mediaMu              sync.Mutex
+	mediaQueued          map[string]struct{}
+	mediaWorker          int
+	mediaQueueFull       atomic.Uint64
+	logger               *slog.Logger
+	rateLimitMu          sync.Mutex
+	rateLimits           map[string]teamModelRateLimit
+	rateLimitTeams       map[uint64]string
+	modelSyncMu          sync.Mutex
+	modelSyncing         map[uint64]struct{}
 }
 
 type teamModelRateLimit struct {
@@ -169,6 +170,7 @@ func NewService(models routeResolver, audits auditRecorder, accounts *accountapp
 		modelSyncing: make(map[uint64]struct{}),
 	}
 	service.UpdateMaxAttempts(maxAttempts)
+	service.UpdateVideoAccountAttempts(videoDefaultAccountAttempts)
 	return service
 }
 
@@ -251,6 +253,37 @@ func (s *Service) SetLogger(logger *slog.Logger) {
 }
 
 func (s *Service) UpdateMaxAttempts(maxAttempts int) { s.maxAttempts.Store(int64(maxAttempts)) }
+
+func (s *Service) UpdateVideoAccountAttempts(attempts int) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	s.videoAccountAttempts.Store(int64(attempts))
+}
+
+type accountAttemptPolicy struct {
+	limit       int
+	allAccounts bool
+}
+
+func newAccountAttemptPolicy(configured int) accountAttemptPolicy {
+	switch {
+	case configured == 0:
+		return accountAttemptPolicy{allAccounts: true}
+	case configured < 0:
+		return accountAttemptPolicy{limit: 3}
+	default:
+		return accountAttemptPolicy{limit: configured}
+	}
+}
+
+func (p accountAttemptPolicy) allows(attempt int) bool {
+	return p.allAccounts || attempt < p.limit
+}
+
+func (p accountAttemptPolicy) hasNext(attempt int) bool {
+	return p.allAccounts || attempt+1 < p.limit
+}
 
 func (s *Service) CreateResponse(ctx context.Context, input Input) (*Result, error) {
 	input.Operation = audit.OperationResponses
@@ -495,13 +528,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 	if input.PreviousResponseID != "" && !supportsStoredResponses {
 		return nil, ErrResponseStateUnsupported
 	}
-	attempts := int(s.maxAttempts.Load())
-	if attempts <= 0 {
-		attempts = 3
-	}
+	attemptPolicy := newAccountAttemptPolicy(int(s.maxAttempts.Load()))
 	idempotencyID, _ := security.NewOpaqueToken(18)
 	if ownership != nil {
-		attempts = 1
+		attemptPolicy = accountAttemptPolicy{limit: 1}
 	}
 	pricingModel := s.providers.PricingModel(route.Provider, route.UpstreamModel)
 	if reservation, priced := audit.EstimateOfficialTextReservation(pricingModel, input.Body); priced {
@@ -534,7 +564,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		return result, err
 	}
 attemptLoop:
-	for attempt := 0; attempt < attempts; attempt++ {
+	for attempt := 0; attemptPolicy.allows(attempt); attempt++ {
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
@@ -599,7 +629,7 @@ attemptLoop:
 			}
 			lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
 			failureFingerprints[lastFailure.Fingerprint]++
-			if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+			if !attemptPolicy.allAccounts && failureFingerprints[lastFailure.Fingerprint] >= 2 {
 				break
 			}
 			continue
@@ -656,13 +686,16 @@ attemptLoop:
 			}
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
-		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
+		finalEgressForbidden := egressForbidden && !attemptPolicy.allAccounts && (attempt > 0 || !attemptPolicy.hasNext(attempt))
 		if isRetryableResponse(response) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
 				// Web 403/code 7 表示出口浏览器会话被拒绝；Provider 已重建会话并降低节点健康，不应误伤账号。
-				delete(excluded, credential.ID)
+				// 固定次数模式允许同账号重试一次；全账号模式保持排除，确保每个账号只进入一次。
+				if !attemptPolicy.allAccounts {
+					delete(excluded, credential.ID)
+				}
 				lease.Release()
 				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
 				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
@@ -751,7 +784,7 @@ attemptLoop:
 			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped)
 			if !lastFailure.AccountScoped {
 				failureFingerprints[lastFailure.Fingerprint]++
-				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+				if !attemptPolicy.allAccounts && failureFingerprints[lastFailure.Fingerprint] >= 2 {
 					break
 				}
 			}

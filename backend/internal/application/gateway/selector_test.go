@@ -429,7 +429,7 @@ func TestSelectorPreferFreeBuildHotReloadAndSaturationFallback(t *testing.T) {
 	accounts := relational.NewAccountRepository(database)
 	freeAccount, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
 		Provider: account.ProviderBuild, Name: "free", SourceKey: "free", EncryptedAccessToken: "encrypted",
-		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 1,
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 1, MaxConcurrent: 4,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -460,6 +460,7 @@ func TestSelectorPreferFreeBuildHotReloadAndSaturationFallback(t *testing.T) {
 	lease.Release()
 
 	selector.UpdatePreferFreeBuild(true)
+	selector.UpdateFreeAccountMaxConcurrent(1)
 	stickyLease, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", "existing-session", nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -481,10 +482,85 @@ func TestSelectorPreferFreeBuildHotReloadAndSaturationFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fallbackLease.Release()
 	defer freeLease.Release()
 	if fallbackLease.Credential.ID != superAccount.ID {
 		t.Fatalf("saturated Free selected %d, want Super fallback %d", fallbackLease.Credential.ID, superAccount.ID)
+	}
+	fallbackLease.Release()
+	selector.UpdateFreeAccountMaxConcurrent(2)
+	secondFreeLease, err := selector.Acquire(ctx, account.ProviderBuild, "grok-4.5", "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondFreeLease.Release()
+	if secondFreeLease.Credential.ID != freeAccount.ID {
+		t.Fatalf("updated per-Free concurrency selected %d, want Free %d", secondFreeLease.Credential.ID, freeAccount.ID)
+	}
+}
+
+func TestSelectorFreeConcurrencyAppliesToWebBasicImageRoute(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-basic-image-concurrency.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	models := relational.NewModelRepository(database)
+	basic, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+		Name: "basic-image", SourceKey: "basic-image", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	super, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierSuper,
+		Name: "super-image", SourceKey: "super-image", EncryptedAccessToken: "encrypted",
+		Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100, MaxConcurrent: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const imageModel = "grok-imagine-image"
+	if err := models.UpsertDiscovered(ctx, account.ProviderWeb, []string{imageModel}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []account.Credential{basic, super} {
+		if err := models.ReplaceAccountCapabilities(ctx, credential.ID, []string{imageModel}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), memory.NewStickyStore(), nil, time.Hour, time.Second, time.Minute)
+	selector.UpdateFreeAccountMaxConcurrent(1)
+	first, err := selector.Acquire(ctx, account.ProviderWeb, imageModel, "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Release()
+	if first.Credential.ID != basic.ID {
+		t.Fatalf("first image lease = %d, want Basic %d", first.Credential.ID, basic.ID)
+	}
+	second, err := selector.Acquire(ctx, account.ProviderWeb, imageModel, "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Credential.ID != super.ID {
+		t.Fatalf("saturated Basic image lease = %d, want Super %d", second.Credential.ID, super.ID)
+	}
+	second.Release()
+	selector.UpdateFreeAccountMaxConcurrent(2)
+	third, err := selector.Acquire(ctx, account.ProviderWeb, imageModel, "", "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Release()
+	if third.Credential.ID != basic.ID {
+		t.Fatalf("updated Basic image lease = %d, want Basic %d", third.Credential.ID, basic.ID)
 	}
 }
 

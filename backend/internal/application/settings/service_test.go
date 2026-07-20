@@ -45,7 +45,9 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	service := NewService(cfg, time.Time{}, 0, repository, nil, func(next config.Config) { applied = next })
 	input := service.Get().Config
 	input.Server.MaxConcurrentRequests = 2048
-	input.Routing.MaxAttempts = 5
+	input.Routing.MaxAttempts = 0
+	input.Routing.FreeAccountMaxConcurrent = 2
+	input.Routing.VideoPremiumAccountAttempts = 4
 	input.Routing.PreferFreeBuild = true
 	input.Audit.BufferSize = cfg.Audit.BufferSize + 1
 	input.Media.MaxTotalBytes = 2 << 30
@@ -60,7 +62,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if applied.Routing.MaxAttempts != 5 || !applied.Routing.PreferFreeBuild {
+	if applied.Routing.MaxAttempts != 0 || applied.Routing.FreeAccountMaxConcurrent != 2 || applied.Routing.VideoPremiumAccountAttempts != 4 || !applied.Routing.PreferFreeBuild {
 		t.Fatalf("runtime configuration was not applied: %#v", applied.Routing)
 	}
 	if applied.Server.MaxConcurrentRequests != 2048 {
@@ -85,7 +87,7 @@ func TestUpdatePersistsAppliesAndReportsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Routing.MaxAttempts != 5 || !reloaded.Routing.PreferFreeBuild || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
+	if reloaded.Server.MaxConcurrentRequests != 2048 || reloaded.Routing.MaxAttempts != 0 || reloaded.Routing.FreeAccountMaxConcurrent != 2 || reloaded.Routing.VideoPremiumAccountAttempts != 4 || !reloaded.Routing.PreferFreeBuild || reloaded.Audit.BufferSize != input.Audit.BufferSize || reloaded.Media.MaxTotalBytes != 2<<30 || reloaded.Media.CleanupThresholdPercent != 75 || reloaded.Batch.SyncConcurrency != 28 || reloaded.Batch.RandomDelay.Value() != 750*time.Millisecond || reloaded.Provider.Console.BaseURL != "https://console.example.com" {
 		t.Fatalf("configuration was not persisted")
 	}
 }

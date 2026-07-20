@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -503,13 +504,18 @@ func TestGenerateImageReturnsWhenEveryCredentialRefreshFails(t *testing.T) {
 	auditRepo := relational.NewAuditRepository(database)
 	responseRepo := relational.NewResponseRepository(database)
 	now := time.Now().UTC()
-	credential, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
-		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth,
-		Name: "expired-image", SourceKey: "expired-image", EncryptedAccessToken: "expired", EncryptedRefreshToken: "refresh",
-		ExpiresAt: now.Add(-time.Minute), Enabled: true, AuthStatus: account.AuthStatusActive, MaxConcurrent: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
+	credentials := make([]account.Credential, 0, 4)
+	for index := range 4 {
+		name := fmt.Sprintf("expired-image-%d", index+1)
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth,
+			Name: name, SourceKey: name, EncryptedAccessToken: "expired", EncryptedRefreshToken: "refresh",
+			ExpiresAt: now.Add(-time.Minute), Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 100 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
 	}
 	if err := modelRepo.UpsertRoutes(ctx, []modeldomain.Route{{
 		PublicID: "image-credential-failure", Provider: account.ProviderBuild, UpstreamModel: "image-credential-failure",
@@ -517,15 +523,17 @@ func TestGenerateImageReturnsWhenEveryCredentialRefreshFails(t *testing.T) {
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"image-credential-failure"}, now); err != nil {
-		t.Fatal(err)
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"image-credential-failure"}, now); err != nil {
+			t.Fatal(err)
+		}
 	}
 	adapter := &credentialFailureImageAdapter{}
 	registry := provider.NewRegistry(adapter)
 	sticky := memory.NewStickyStore()
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
 	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
-	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 1)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 0)
 
 	_, err = service.GenerateImage(ctx, ImageGenerationInput{
 		RequestID: "req-image-credential-failure", ClientKey: clientkey.Key{ID: 1, Name: "image-key"},
@@ -536,6 +544,9 @@ func TestGenerateImageReturnsWhenEveryCredentialRefreshFails(t *testing.T) {
 	}
 	if adapter.generationCalls.Load() != 0 {
 		t.Fatalf("generation calls = %d", adapter.generationCalls.Load())
+	}
+	if adapter.refreshCalls.Load() != int64(len(credentials)) {
+		t.Fatalf("refresh calls = %d, want one per account", adapter.refreshCalls.Load())
 	}
 }
 
@@ -707,8 +718,8 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	auditRepo := relational.NewAuditRepository(database)
 	responseRepo := relational.NewResponseRepository(database)
 	keyRepo := relational.NewClientKeyRepository(database)
-	credentials := make([]account.Credential, 0, 3)
-	for index, name := range []string{"first", "second", "third"} {
+	credentials := make([]account.Credential, 0, 4)
+	for index, name := range []string{"first", "second", "third", "fourth"} {
 		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
 			Provider: account.ProviderBuild, Name: name, SourceKey: name, EncryptedAccessToken: name,
 			ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
@@ -740,7 +751,7 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	sticky := memory.NewStickyStore()
 	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
 	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
-	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 0)
 
 	_, err = service.CreateResponse(ctx, Input{
 		RequestID: "req-systemic-403", ClientKey: clientKey, PublicModel: "grok-systemic",
@@ -754,8 +765,13 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 		t.Fatalf("upstream failure = %#v", upstreamFailure)
 	}
 	attempts := adapter.Attempts()
-	if len(attempts) != 3 || attempts[0] != credentials[0].ID || attempts[1] != credentials[1].ID || attempts[2] != credentials[2].ID {
+	if len(attempts) != len(credentials) {
 		t.Fatalf("attempts = %#v", attempts)
+	}
+	for index, credential := range credentials {
+		if attempts[index] != credential.ID {
+			t.Fatalf("attempts = %#v, want each account once in priority order", attempts)
+		}
 	}
 	for _, credential := range credentials {
 		observed, getErr := accountRepo.Get(ctx, credential.ID)
@@ -767,7 +783,7 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 		}
 	}
 	logs, total, err := auditRepo.List(ctx, 0, 10)
-	if err != nil || total != 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[2].ID {
+	if err != nil || total != 1 || logs[0].StatusCode != http.StatusForbidden || logs[0].ErrorCode != "upstream_forbidden" || logs[0].AccountID == nil || *logs[0].AccountID != credentials[len(credentials)-1].ID {
 		t.Fatalf("audit = %#v, total=%d, err=%v", logs, total, err)
 	}
 }
@@ -1586,6 +1602,7 @@ type webChatQuotaAdapter struct {
 
 type credentialFailureImageAdapter struct {
 	generationCalls atomic.Int64
+	refreshCalls    atomic.Int64
 }
 
 func (a *credentialFailureImageAdapter) Provider() account.Provider { return account.ProviderBuild }
@@ -1599,6 +1616,7 @@ func (a *credentialFailureImageAdapter) Definition() provider.Definition {
 }
 
 func (a *credentialFailureImageAdapter) RefreshCredential(context.Context, account.Credential) (provider.RefreshedCredential, error) {
+	a.refreshCalls.Add(1)
 	return provider.RefreshedCredential{}, errors.New("simulated credential refresh failure")
 }
 

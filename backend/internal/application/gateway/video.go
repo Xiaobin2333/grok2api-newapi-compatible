@@ -24,11 +24,12 @@ import (
 )
 
 const (
-	videoJobTimeout          = 2 * time.Hour
-	videoJobLease            = videoJobTimeout + 5*time.Minute
-	videoJobRecoveryInterval = 30 * time.Second
-	videoOutputAttempts      = 3
-	maxVideoInputJSONBytes   = 1 << 20
+	videoJobTimeout             = 2 * time.Hour
+	videoJobLease               = videoJobTimeout + 5*time.Minute
+	videoJobRecoveryInterval    = 30 * time.Second
+	videoDefaultAccountAttempts = 2
+	videoOutputAttempts         = 3
+	maxVideoInputJSONBytes      = 1 << 20
 )
 
 type VideoReference struct {
@@ -331,89 +332,66 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		s.failVideoJob(parent, job, "input_unavailable", fmt.Errorf("读取视频参考图片: %w", err))
 		return
 	}
-	// 视频任务创建时已持久化账号归属；恢复只能重新获取原账号，禁止因后续
-	// 轮询或结果处理失败切换到其他账号。
-	lease, err := s.selector.AcquirePinned(ctx, route.Provider, job.AccountID, route.UpstreamModel, "", true)
-	if err != nil {
-		if parent.Err() != nil {
-			s.deferVideoJob(parent, job)
-			return
-		}
-		s.failVideoJob(parent, job, "account_unavailable", err)
-		return
-	}
-	defer lease.Release()
 	adapter, ok := s.providers.Videos(route.Provider)
 	if !ok {
 		s.failVideoJob(parent, job, "provider_unavailable", ErrNoAvailableAccount)
 		return
 	}
-	lastProgress := job.Progress
-	result, err := adapter.GenerateVideo(ctx, provider.VideoRequest{
-		Credential: lease.Credential, Billing: lease.Billing, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
-		ReferenceURLs: referenceURLs,
-		Progress: func(value int) {
-			value = min(99, max(1, value))
-			if value-lastProgress < 5 {
-				return
-			}
-			lastProgress = value
-			job.Progress, job.UpdatedAt = value, time.Now().UTC()
-			leaseUntil := job.UpdatedAt.Add(videoJobLease)
-			job.LeaseUntil = &leaseUntil
-			updateCtx, updateCancel := context.WithTimeout(context.Background(), 3*time.Second)
-			_ = s.mediaJobs.UpdateMediaJob(updateCtx, job)
-			updateCancel()
-		},
-	})
-	if err == nil && result.AssetID == "" && result.URL != "" {
-		result, err = s.persistRemoteVideo(ctx, job.ID, adapter, lease.Credential, result)
-	}
+	execution := s.executeVideoAttempts(ctx, &job, route, adapter, referenceURLs)
+	lease, result, err := execution.lease, execution.result, execution.err
 	if err != nil {
 		if parent.Err() != nil {
+			if lease != nil {
+				lease.Release()
+			}
 			s.deferVideoJob(parent, job)
 			return
 		}
-		s.logger.Error("video_upstream_failed", "event_id", "video_usage_"+job.ID, "request_id", job.RequestID, "model", job.Model, "provider", route.Provider, "account_id", lease.Credential.ID, "error", err)
+		credential := execution.credential
+		s.logger.Error("video_upstream_failed", "event_id", "video_usage_"+job.ID, "request_id", job.RequestID, "model", job.Model, "provider", route.Provider, "account_id", credential.ID, "error", sanitizeDiagnosticText(err.Error(), diagnosticTextLimit))
 		failureCtx, failureCancel := context.WithTimeout(context.Background(), finalizationTimeout)
 		failureHandled := false
 		if errors.Is(err, provider.ErrUnauthorized) {
-			s.handleVideoCredentialRejected(failureCtx, lease.Credential)
+			if credential.ID != 0 {
+				s.handleVideoCredentialRejected(failureCtx, credential)
+			}
 			failureHandled = true
 		} else if status, ok := provider.ErrorHTTPStatus(err); ok {
 			switch {
-			case status == http.StatusUnauthorized && lease.Credential.AuthType == account.AuthTypeSSO:
-				s.markSSOCredentialRejected(failureCtx, lease.Credential, fmt.Sprintf("%s SSO credential rejected", lease.Credential.Provider))
+			case status == http.StatusUnauthorized && credential.ID != 0 && credential.AuthType == account.AuthTypeSSO:
+				s.markSSOCredentialRejected(failureCtx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
 				failureHandled = true
-			case status == http.StatusForbidden && s.providers.RetryForbiddenAsEgress(lease.Credential.Provider):
+			case status == http.StatusForbidden && credential.ID != 0 && s.providers.RetryForbiddenAsEgress(credential.Provider):
 				// Web Provider 已对 anti-bot 403 降低出口健康并重建浏览器会话；
-				// 视频请求已提交，不能换号重试，也不能误伤账号池。
+				// 每账号重试和换号已经由 executeVideoAttempts 限定处理，不误伤账号池。
 				// 符合资格的 Build 主地址 403 由 Adapter 尝试 XAI，不在此禁用账号。
 				failureHandled = true
-			case status == http.StatusForbidden && lease.Credential.Provider == account.ProviderBuild:
-				if !account.IsBuildSuper(lease.Credential, lease.Billing) {
+			case status == http.StatusForbidden && credential.ID != 0 && credential.Provider == account.ProviderBuild:
+				if !account.IsBuildSuper(credential, execution.billing) {
 					// 非 Super 的 403 按账号级故障处理；auto 模式不会因此回退 XAI。
-					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
+					s.selector.MarkFailure(failureCtx, credential, status, 0)
 				}
 				// Super（Billing paid 或 entitlement）的 403 保持服务级处理。
 				failureHandled = true
-			case (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && lease.QuotaMode != "":
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, lease.Credential.ID, lease.QuotaMode, 0)
-				s.selector.MarkQuotaStateChanged(lease.Credential.Provider)
+			case credential.ID != 0 && (status == http.StatusPaymentRequired || status == http.StatusTooManyRequests) && execution.quotaMode != "":
+				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(failureCtx, credential.ID, execution.quotaMode, 0)
+				s.selector.MarkQuotaStateChanged(credential.Provider)
 				if reconcileErr != nil || !exhausted {
-					s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
+					s.selector.MarkFailure(failureCtx, credential, status, 0)
 				}
 				failureHandled = true
 			case status >= http.StatusInternalServerError:
 				// 5xx 是 Provider 服务级故障，不应让某个账号退出号池。
 				failureHandled = true
 			default:
-				s.selector.MarkFailure(failureCtx, lease.Credential, status, 0)
+				if credential.ID != 0 {
+					s.selector.MarkFailure(failureCtx, credential, status, 0)
+				}
 				failureHandled = true
 			}
 		}
-		if !failureHandled && !provider.IsMediaPostProcessingError(err) {
-			s.selector.MarkFailure(failureCtx, lease.Credential, 0, 0)
+		if !failureHandled && credential.ID != 0 && !provider.IsMediaPostProcessingError(err) {
+			s.selector.MarkFailure(failureCtx, credential, 0, 0)
 		}
 		failureCancel()
 		applyMediaJobEgress(&job, egressTrace, route.Provider)
@@ -421,9 +399,13 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		if status, ok := provider.ErrorHTTPStatus(err); errors.Is(err, provider.ErrUnauthorized) || (ok && (status == http.StatusUnauthorized || status == http.StatusForbidden)) {
 			failureCode, publicErr = "provider_unavailable", errors.New("上游服务暂不可用")
 		}
-		s.failVideoJob(parent, job, failureCode, publicErr)
+		if lease != nil {
+			lease.Release()
+		}
+		s.failVideoJob(parent, job, failureCode, publicErr, execution.attempts...)
 		return
 	}
+	defer lease.Release()
 	now := time.Now().UTC()
 	job.Status, job.Progress, job.UpstreamURL, job.ContentType = media.StatusCompleted, 100, result.URL, result.ContentType
 	// 成功终态必须清空历史错误字段，避免管理端/恢复路径把中间失败文案当成最终结果。
@@ -438,12 +420,151 @@ func (s *Service) runVideoJob(parent context.Context, job media.Job, route model
 		return
 	}
 	s.selector.MarkSuccess(context.Background(), lease.Credential)
-	if err := s.recordVideoAudit(context.Background(), job, time.Since(startedAt).Milliseconds()); err != nil {
+	if err := s.recordVideoAudit(context.Background(), job, time.Since(startedAt).Milliseconds(), execution.attempts...); err != nil {
 		s.logger.Error("video_usage_record_failed", "job_id", job.ID, "event_id", "video_usage_"+job.ID, "error", err)
 	}
 	if quotaKind, _ := s.providers.QuotaKind(route.Provider); quotaKind == provider.QuotaRemoteWindow && lease.QuotaMode == "weekly" {
 		s.accounts.QueueQuotaRefresh(job.AccountID, lease.QuotaMode)
 	}
+}
+
+type videoExecution struct {
+	result     provider.VideoResult
+	lease      *accountLease
+	credential account.Credential
+	billing    *account.Billing
+	quotaMode  string
+	attempts   []audit.Attempt
+	err        error
+}
+
+func (s *Service) executeVideoAttempts(ctx context.Context, job *media.Job, route model.Route, adapter provider.VideoAdapter, referenceURLs []string) videoExecution {
+	policy := newAccountAttemptPolicy(int(s.maxAttempts.Load()))
+	premiumAccountAttempts := int(s.videoAccountAttempts.Load())
+	if premiumAccountAttempts < 1 {
+		premiumAccountAttempts = videoDefaultAccountAttempts
+	}
+	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
+	excluded := make(map[uint64]bool)
+	recorder := newFailureAttemptRecorder(http.MethodPost, "/videos/generations")
+	lastProgress := job.Progress
+	var last videoExecution
+	for accountAttempt := 0; policy.allows(accountAttempt); accountAttempt++ {
+		var lease *accountLease
+		var err error
+		if accountAttempt == 0 {
+			lease, err = s.selector.AcquirePinned(ctx, route.Provider, job.AccountID, route.UpstreamModel, quotaMode, true)
+			if err != nil {
+				excluded[job.AccountID] = true
+				lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, "", excluded, false)
+			}
+		} else {
+			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, "", excluded, false)
+		}
+		if err != nil {
+			last.err = firstError(last.err, err)
+			break
+		}
+		excluded[lease.Credential.ID] = true
+		credentialStartedAt := time.Now()
+		credential, err := s.accounts.EnsureCredential(ctx, lease.Credential, false)
+		recorder.captureCredentialFailure(lease.Credential, credentialStartedAt, false, err)
+		if err != nil {
+			last = videoExecution{credential: lease.Credential, quotaMode: lease.QuotaMode, err: err}
+			lease.Release()
+			continue
+		}
+		lease.Credential = credential
+		last = videoExecution{lease: lease, credential: credential, billing: lease.Billing, quotaMode: lease.QuotaMode}
+		perAccountAttempts := videoAttemptsForCredential(credential, premiumAccountAttempts)
+		if job.AccountID != credential.ID || job.AccountName != credential.Name {
+			job.AccountID, job.AccountName, job.UpdatedAt = credential.ID, credential.Name, time.Now().UTC()
+			if err := s.mediaJobs.UpdateMediaJob(ctx, *job); err != nil {
+				lease.Release()
+				last.lease, last.err = nil, err
+				break
+			}
+		}
+		for sameAccountAttempt := 0; sameAccountAttempt < perAccountAttempts; sameAccountAttempt++ {
+			startedAt := time.Now()
+			result, generateErr := adapter.GenerateVideo(ctx, provider.VideoRequest{
+				Credential: credential, Billing: lease.Billing, JobID: job.ID, Prompt: job.Prompt, Duration: job.Seconds, AspectRatio: job.Size, Resolution: job.Quality,
+				ReferenceURLs: referenceURLs,
+				Progress: func(value int) {
+					value = min(99, max(1, value))
+					if value-lastProgress < 5 {
+						return
+					}
+					lastProgress = value
+					job.Progress, job.UpdatedAt = value, time.Now().UTC()
+					leaseUntil := job.UpdatedAt.Add(videoJobLease)
+					job.LeaseUntil = &leaseUntil
+					updateCtx, updateCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = s.mediaJobs.UpdateMediaJob(updateCtx, *job)
+					updateCancel()
+				},
+			})
+			recorder.captureProviderFailure(credential, startedAt, "video_generation", generateErr)
+			last.result, last.err = result, generateErr
+			if generateErr == nil {
+				if result.AssetID == "" && result.URL != "" {
+					result, generateErr = s.persistRemoteVideo(ctx, job.ID, adapter, credential, result)
+					recorder.captureProviderFailure(credential, startedAt, "video_persistence", generateErr)
+					last.result, last.err = result, generateErr
+				}
+				if generateErr == nil {
+					last.attempts = recorder.snapshot()
+					return last
+				}
+				break
+			}
+			if !retryVideoSameAccount(route.Provider, generateErr) {
+				break
+			}
+		}
+		if !retryVideoNextAccount(route.Provider, last.err) {
+			last.attempts = recorder.snapshot()
+			return last
+		}
+		if errors.Is(last.err, provider.ErrUnauthorized) {
+			s.handleVideoCredentialRejected(context.Background(), credential)
+		} else if status, ok := provider.ErrorHTTPStatus(last.err); ok && status == http.StatusUnauthorized {
+			s.markSSOCredentialRejected(context.Background(), credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
+		}
+		lease.Release()
+		last.lease = nil
+	}
+	last.attempts = recorder.snapshot()
+	if last.err == nil {
+		last.err = ErrNoAvailableAccount
+	}
+	return last
+}
+
+func videoAttemptsForCredential(credential account.Credential, premiumAttempts int) int {
+	if premiumAttempts > 1 && (credential.WebTier == account.WebTierSuper || credential.WebTier == account.WebTierHeavy) {
+		return premiumAttempts
+	}
+	return 1
+}
+
+func retryVideoSameAccount(providerValue account.Provider, err error) bool {
+	if providerValue != account.ProviderWeb {
+		return false
+	}
+	status, ok := provider.ErrorHTTPStatus(err)
+	return ok && status == http.StatusForbidden
+}
+
+func retryVideoNextAccount(providerValue account.Provider, err error) bool {
+	if providerValue != account.ProviderWeb {
+		return false
+	}
+	if errors.Is(err, provider.ErrUnauthorized) {
+		return true
+	}
+	status, ok := provider.ErrorHTTPStatus(err)
+	return ok && (status == http.StatusUnauthorized || status == http.StatusForbidden)
 }
 
 func (s *Service) handleVideoCredentialRejected(ctx context.Context, credential account.Credential) {
@@ -519,7 +640,7 @@ func (s *Service) reconcileVideoUsage(ctx context.Context) error {
 	return result
 }
 
-func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationMS int64) error {
+func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationMS int64, attempts ...audit.Attempt) error {
 	var accountID *uint64
 	if job.AccountID > 0 {
 		value := job.AccountID
@@ -548,6 +669,7 @@ func (s *Service) recordVideoAudit(ctx context.Context, job media.Job, durationM
 		MediaInputImages: int64(videoInputReferenceCount(decodeVideoInput(job.InputJSON))),
 		DurationMS:       durationMS, CreatedAt: createdAt,
 	}
+	record.Attempts = append([]audit.Attempt(nil), attempts...)
 	if job.Status == media.StatusCompleted {
 		record.MediaOutputSeconds = int64(max(0, job.Seconds))
 	}
@@ -739,7 +861,7 @@ func VideoJobResponseMetadata(job media.Job) (openAICompatible bool, responseSiz
 	}
 }
 
-func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, err error) {
+func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, err error, attempts ...audit.Attempt) {
 	now := time.Now().UTC()
 	job.Status, job.ErrorCode, job.ErrorMessage = media.StatusFailed, code, err.Error()
 	if len(job.ErrorMessage) > 512 {
@@ -750,7 +872,7 @@ func (s *Service) failVideoJob(ctx context.Context, job media.Job, code string, 
 		s.logger.Error("video_job_terminal_write_failed", "job_id", job.ID, "error", updateErr)
 		return
 	}
-	if auditErr := s.recordVideoAudit(context.Background(), job, max(int64(0), now.Sub(job.CreatedAt).Milliseconds())); auditErr != nil {
+	if auditErr := s.recordVideoAudit(context.Background(), job, max(int64(0), now.Sub(job.CreatedAt).Milliseconds()), attempts...); auditErr != nil {
 		s.logger.Error("video_usage_record_failed", "job_id", job.ID, "event_id", "video_usage_"+job.ID, "error", auditErr)
 	}
 	s.cancelBillingReservation("video_usage_" + job.ID)

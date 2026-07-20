@@ -8,14 +8,17 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/media"
+	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
 	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/runtime/memory"
@@ -151,6 +154,71 @@ func TestVideoOAuthUnauthorizedMarksAccountFailure(t *testing.T) {
 	}
 }
 
+func TestExecuteVideoAttemptsRetriesPremiumAccountThenFailsOverOnce(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "video-account-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	models := relational.NewModelRepository(database)
+	credentials := make([]account.Credential, 0, 2)
+	for index, tier := range []account.WebTier{account.WebTierSuper, account.WebTierHeavy} {
+		name := fmt.Sprintf("video-%s", tier)
+		credential, _, createErr := accounts.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: tier,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted", ExpiresAt: time.Now().Add(time.Hour),
+			Enabled: true, AuthStatus: account.AuthStatusActive, Priority: 200 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	const upstreamModel = "grok-imagine-video"
+	if err := models.UpsertDiscovered(ctx, account.ProviderWeb, []string{upstreamModel}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := models.ReplaceAccountCapabilities(ctx, credential.ID, []string{upstreamModel}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	adapter := &videoRetryAdapter{failAccountID: credentials[0].ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accounts, relational.NewAuditRepository(database), memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accounts, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(models, relational.NewAuditRepository(database), accountService, nil, registry, selector, nil, 0)
+	service.UpdateVideoAccountAttempts(2)
+	jobs := &videoExecutionRepository{}
+	service.mediaJobs = jobs
+	job := media.Job{ID: "video_retry", AccountID: credentials[0].ID, AccountName: credentials[0].Name, Progress: 1}
+	execution := service.executeVideoAttempts(ctx, &job, modeldomain.Route{
+		ID: 1, PublicID: upstreamModel, Provider: account.ProviderWeb, UpstreamModel: upstreamModel, Capability: modeldomain.CapabilityVideo,
+	}, adapter, nil)
+	if execution.err != nil {
+		t.Fatal(execution.err)
+	}
+	defer execution.lease.Release()
+	if len(adapter.accountIDs) != 3 || adapter.accountIDs[0] != credentials[0].ID || adapter.accountIDs[1] != credentials[0].ID || adapter.accountIDs[2] != credentials[1].ID {
+		t.Fatalf("video attempts = %#v", adapter.accountIDs)
+	}
+	if execution.credential.ID != credentials[1].ID || job.AccountID != credentials[1].ID || jobs.job.AccountID != credentials[1].ID {
+		t.Fatalf("final credential=%d job=%d stored=%d", execution.credential.ID, job.AccountID, jobs.job.AccountID)
+	}
+	if len(execution.attempts) != 2 || execution.attempts[0].UpstreamStatusCode == nil || *execution.attempts[0].UpstreamStatusCode != http.StatusForbidden {
+		t.Fatalf("failure attempts = %#v", execution.attempts)
+	}
+	if got := videoAttemptsForCredential(account.Credential{WebTier: account.WebTierBasic}, 9); got != 1 {
+		t.Fatalf("basic account attempts = %d", got)
+	}
+}
+
 func TestRecoverVideoJobsRetriesUsageWithoutRegeneratingVideo(t *testing.T) {
 	completedAt := time.Now().UTC()
 	repository := &videoUsageRepository{job: media.Job{
@@ -263,6 +331,48 @@ type videoPersistAdapter struct {
 	generateCalls    int
 	downloadCalls    int
 	lastCredentialID uint64
+}
+
+type videoRetryAdapter struct {
+	failAccountID uint64
+	accountIDs    []uint64
+}
+
+func (a *videoRetryAdapter) Provider() account.Provider { return account.ProviderWeb }
+
+func (a *videoRetryAdapter) Definition() provider.Definition {
+	return provider.Definition{
+		Provider: account.ProviderWeb, ModelNamespace: account.ProviderWeb.ModelNamespace(), ModelCatalog: provider.ModelCatalogStatic,
+		ModelCapabilities: []modeldomain.Capability{modeldomain.CapabilityVideo},
+		Credential:        provider.CredentialSurface{AuthType: account.AuthTypeSSO}, Media: provider.MediaSurface{VideoGeneration: true},
+		Inference: provider.InferencePolicy{Usage: provider.UsageEstimated, RetryForbiddenAsEgress: true},
+	}
+}
+
+func (a *videoRetryAdapter) TierOrder(string) []account.WebTier {
+	return []account.WebTier{account.WebTierSuper, account.WebTierHeavy}
+}
+
+func (a *videoRetryAdapter) QuotaMode(string) string { return "" }
+
+func (a *videoRetryAdapter) GenerateVideo(_ context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
+	a.accountIDs = append(a.accountIDs, request.Credential.ID)
+	if request.Credential.ID == a.failAccountID {
+		return provider.VideoResult{}, videoRetryStatusError{status: http.StatusForbidden}
+	}
+	return provider.VideoResult{AssetID: "video_asset_retry", ContentType: "video/mp4"}, nil
+}
+
+type videoRetryStatusError struct{ status int }
+
+func (e videoRetryStatusError) Error() string       { return fmt.Sprintf("upstream returned %d", e.status) }
+func (e videoRetryStatusError) HTTPStatusCode() int { return e.status }
+
+type videoExecutionRepository struct{ videoUsageRepository }
+
+func (r *videoExecutionRepository) UpdateMediaJob(_ context.Context, job media.Job) error {
+	r.job = job
+	return nil
 }
 
 func (a *videoPersistAdapter) Provider() account.Provider { return account.ProviderWeb }
