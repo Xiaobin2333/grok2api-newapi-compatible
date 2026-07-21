@@ -844,6 +844,7 @@ func (a *Adapter) editBasicImageViaChat(ctx context.Context, request provider.Im
 		images = append(images, image)
 	}
 	request.ImageURLs, images, request.Prompt = reorderImageReferencesByAspectRatio(request.ImageURLs, images, request.Prompt, ratio)
+	ratio = basicImageEditAspectRatio(ratio, images)
 
 	attachments := make([]string, 0, len(images))
 	directUploadAvailable := true
@@ -980,9 +981,10 @@ func buildBasicImageEditPayload(prompt, ratio string, references []provider.Imag
 	payload := buildWebChatPayload(basicImageEditPrompt(prompt, ratio, references), "fast", attachments)
 	payload["disableSearch"] = true
 	payload["disableTextFollowUps"] = true
+	payload["enableSideBySide"] = false
 	payload["imageGenerationCount"] = 1
 	payload["toolOverrides"] = map[string]any{"imageGen": true}
-	payload["customPersonality"] = "Act as a precision image editor. Treat every attached image as an authoritative visual reference, preserve identity and all untouched details, and obey the numbered reference roles in the edit instructions. Produce an image rather than describing one."
+	payload["customPersonality"] = "Act as a precision image-to-image editor, not a text-to-image reinterpretation model. Treat every attached image as authoritative source material, preserve identity and all untouched details at reference-level fidelity, keep numbered roles isolated, and produce exactly one edited image without commentary."
 	if _, ok := numericAspectRatio(ratio); ok {
 		payload["responseMetadata"] = map[string]any{"modelConfigOverride": map[string]any{"modelMap": map[string]any{
 			"imageGenModelConfig": map[string]any{"aspectRatio": ratio},
@@ -998,9 +1000,13 @@ func basicImageEditPrompt(prompt, ratio string, references []provider.ImageInput
 	if referenceCount > 1 {
 		message = fmt.Sprintf("Drawing: Perform a faithful image edit using all %d attached reference images, numbered image 1 through image %d in attachment order", referenceCount, referenceCount)
 		message += ". Keep each numbered reference's requested role (character, scene, object, or style) distinct; do not swap or merge their roles"
-		message += ". The first attachment anchors canvas orientation only; all numbered references remain equally authoritative for their assigned semantic roles"
+		message += ". The first attachment is ordered first to help match the requested canvas orientation; that ordering does not reduce, replace, or override image 1's assigned semantic role. Every numbered reference remains equally authoritative for its assigned role"
 	}
 	message += ". Preserve identity-defining facial features, body shape, pose, composition, clothing, objects, colors, lighting, and art style unless the edit instructions explicitly change them"
+	message += ". Use the reference pixels as source material rather than loose inspiration; do not redesign, substitute, beautify, simplify, or invent details that the edit instructions leave unchanged"
+	if referenceCount > 1 {
+		message += ". Bind each numbered image to its stated role before rendering, then keep identities, objects, scene elements, and style attributes from crossing between reference numbers"
+	}
 	message += ". Apply only the requested changes and keep every other visible detail consistent"
 	if layout := basicImageReferenceLayout(references); layout != "" {
 		message += ". Reference geometry: " + layout
@@ -1031,6 +1037,32 @@ func basicImageReferenceLayout(references []provider.ImageInput) string {
 		values = append(values, fmt.Sprintf("image %d is %s (%dx%d)", index+1, orientation, width, height))
 	}
 	return strings.Join(values, "; ")
+}
+
+func basicImageEditAspectRatio(requested string, references []provider.ImageInput) string {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested != "" && requested != "auto" {
+		return requested
+	}
+	if len(references) == 0 {
+		return requested
+	}
+	width, height, ok := referenceImageDimensions(references[0])
+	if !ok {
+		return requested
+	}
+	target := float64(width) / float64(height)
+	best := ""
+	bestDistance := math.Inf(1)
+	for _, candidate := range []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20"} {
+		value, _ := numericAspectRatio(candidate)
+		distance := math.Abs(math.Log(target / value))
+		if distance < bestDistance {
+			best = candidate
+			bestDistance = distance
+		}
+	}
+	return best
 }
 
 func reorderImageReferencesByAspectRatio(rawURLs []string, images []provider.ImageInput, prompt, aspectRatio string) ([]string, []provider.ImageInput, string) {

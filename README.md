@@ -57,6 +57,17 @@ Grok2API is a Go-based Grok API gateway with a built-in React admin console. It 
 - **Admin console**: dashboard, accounts, model routes, client keys, image gallery, video library, request audits, runtime settings, and update checks
 - **Optional account auto-clean** (off by default): runtime settings can periodically hard-delete accounts already marked `reauthRequired` whose `reauth_marked_at` exceeds the configured minimum age. Cooldown-only and still-active permanent-refresh drain accounts are never selected. Accounts with active inference leases or queued/in-progress video jobs are skipped. A distributed maintenance lock prevents duplicate work across shared-runtime instances, and each tick has a bounded deletion budget. First scan waits one interval after enable and after process start; only actual policy changes reschedule the next tick.
 
+### Enhancements in this fork
+
+- **Automatic Grok image routing**: callers may consistently request `grok-imagine-image`; requests with references are normalized to `grok-imagine-image-edit` before capability checks, account selection, billing, and audit creation.
+- **OpenAI-compatible image edits**: `/v1/images/edits` accepts JSON URLs and OpenAI SDK `multipart/form-data` uploads through `image`, `image[]`, `images`, `images[]`, `image_urls`, and `image_urls[]`. Multipart text values also accept URL strings, `{ "url": "..." }` objects, and mixed JSON arrays. URL, `b64_json`, and SSE responses retain the existing Images protocol.
+- **Free/Basic Chat image editing**: an admin switch lets Basic Web accounts simulate `grok-imagine-image-edit` through `grok-chat-fast` attachments. The adapter sends a strict image-to-image preservation contract, isolates numbered reference roles, disables side-by-side variants, and inherits the first reference's real aspect ratio when the caller uses `auto` or omits a ratio.
+- **Reference-aware composition**: explicit target ratios reorder locally available references by closest geometry and rewrite `image 1` / `图片1` prompt references so character, scene, object, and style roles remain aligned.
+- **Account-pool resilience**: `maxAttempts: 0` tries every eligible account at most once; positive attempt limits are uncapped inputs. Free/Basic per-account concurrency and Super/Heavy video attempts are independently configurable, while Lite image batches can continue across accounts.
+- **Egress controls**: individual proxies can be forced to bypass cooldown, and shared proxy-pool failures are isolated from node-wide health. Account-bound `{account}` proxies automatically use pool behavior.
+- **Media durability and diagnostics**: image/video inputs and outputs are persisted where required, failed attempts are recorded with redacted upstream diagnostics, and asynchronous video jobs retain account, egress, billing, and audit context.
+- **NewAPI and admin compatibility**: image/video request types, model discovery, pricing, audits, runtime settings, API docs, and management views include the fork-specific routing and reliability controls.
+
 ## Architecture
 
 ```mermaid
@@ -231,7 +242,7 @@ GET /v1/models
 | `grok-chat-heavy` | Chat / Responses / Messages | Heavy |
 | `grok-imagine-image` | Image generation | Basic |
 | `grok-imagine-image-quality` | High-quality image generation | Super |
-| `grok-imagine-image-edit` | Image editing | Super |
+| `grok-imagine-image-edit` | Image editing | Basic via Chat when enabled; Super native |
 | `grok-imagine-video` | Video generation | Super |
 
 ### Built-in Grok Console models

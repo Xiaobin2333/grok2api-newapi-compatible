@@ -876,6 +876,63 @@ func TestImageEditAcceptsOpenAIMultipartFileUpload(t *testing.T) {
 	}
 }
 
+func TestImageEditMultipartParsesStructuredReferenceValuesInFieldOrder(t *testing.T) {
+	images := &recordingImageGateway{}
+	router := imageHandlerTestRouter(images)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, field := range [][2]string{
+		{"model", "grok-imagine-image"},
+		{"prompt", "combine references"},
+		{"image", `{"url":"https://example.com/character.png"}`},
+		{"images", `["https://example.com/scene.png",{"url":"https://example.com/prop.png"}]`},
+		{"image_urls", `["https://example.com/prop.png","https://example.com/style.png"]`},
+	} {
+		if err := writer.WriteField(field[0], field[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || len(images.editInputs) != 1 {
+		t.Fatalf("status=%d body=%s inputs=%#v", recorder.Code, recorder.Body.String(), images.editInputs)
+	}
+	want := []string{
+		"https://example.com/character.png",
+		"https://example.com/scene.png",
+		"https://example.com/prop.png",
+		"https://example.com/style.png",
+	}
+	if !slices.Equal(images.editInputs[0].ImageURLs, want) {
+		t.Fatalf("image URLs=%#v", images.editInputs[0].ImageURLs)
+	}
+}
+
+func TestImageEditMultipartPreservesStructuredFileIDValidation(t *testing.T) {
+	router := imageHandlerTestRouter(&recordingImageGateway{})
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "grok-imagine-image")
+	_ = writer.WriteField("prompt", "edit")
+	_ = writer.WriteField("image", `{"file_id":"file_123"}`)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"unsupported_parameter"`) || !strings.Contains(recorder.Body.String(), "file_id") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestImageEditMultipartRejectsNonImageAndMask(t *testing.T) {
 	for _, test := range []struct {
 		name      string

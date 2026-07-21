@@ -748,6 +748,63 @@ func TestBasicImageEditUsesFastChatAttachmentsAndRejectsTextOnlyResult(t *testin
 	}
 }
 
+func TestBasicImageEditChatPayloadInheritsFirstReferenceRatio(t *testing.T) {
+	landscape := "data:image/png;base64," + base64.StdEncoding.EncodeToString(testPNG(t, 1600, 900))
+	portrait := "data:image/png;base64," + base64.StdEncoding.EncodeToString(testPNG(t, 600, 900))
+	uploadCount := 0
+	observedRatio := ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/http/upload-file-v2/direct":
+			uploadCount++
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(writer, `{"uploadId":"upload_%d","fileMetadata":{"fileMetadataId":"file_%d","fileUri":"users/test/reference_%d/content"}}`, uploadCount, uploadCount, uploadCount)
+		case "/rest/app-chat/conversations/new":
+			var payload map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+				t.Errorf("decode payload: %v", err)
+			}
+			metadata, _ := payload["responseMetadata"].(map[string]any)
+			override, _ := metadata["modelConfigOverride"].(map[string]any)
+			modelMap, _ := override["modelMap"].(map[string]any)
+			imageConfig, _ := modelMap["imageGenModelConfig"].(map[string]any)
+			observedRatio, _ = imageConfig["aspectRatio"].(string)
+			attachments, _ := payload["fileAttachments"].([]any)
+			if len(attachments) != 2 || attachments[0] != "file_1" || attachments[1] != "file_2" {
+				t.Errorf("attachments=%#v", attachments)
+			}
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, `{"result":{"response":{"token":"done","isThinking":false,"messageTag":"final"}}}`)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	statsig := base64.RawStdEncoding.EncodeToString(bytes.Repeat([]byte{'s'}, 70))
+	adapter := NewAdapter(Config{BaseURL: server.URL, StatsigMode: "manual", StatsigManualValue: statsig, EnableBasicImageEditViaChat: true}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	response, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
+		Credential: account.Credential{ID: 1, WebTier: account.WebTierBasic, EncryptedAccessToken: encrypted},
+		Prompt:     "图片1是角色，图片2是场景", ImageURLs: []string{landscape, portrait}, Count: 1, Resolution: "1k",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway || uploadCount != 2 || observedRatio != "16:9" {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status=%d uploads=%d ratio=%q body=%s", response.StatusCode, uploadCount, observedRatio, body)
+	}
+}
+
 func TestBasicImageEditSwitchBlocksChatAndImagineFallback(t *testing.T) {
 	adapter := &Adapter{cfg: Config{EnableBasicImageEditViaChat: false}}
 	response, err := adapter.EditImage(context.Background(), provider.ImageEditRequest{
@@ -887,12 +944,15 @@ func TestBuildBasicImageEditPayloadKeepsMultiReferenceSemantics(t *testing.T) {
 	}
 	payload := buildBasicImageEditPayload("图片1是角色，图片2是场景", "9:16", references, []string{"file_1", "file_2"})
 	message, _ := payload["message"].(string)
-	if !strings.Contains(message, "all 2 attached reference images") || !strings.Contains(message, "do not swap or merge their roles") || !strings.Contains(message, "equally authoritative") || !strings.Contains(message, "image 1 is portrait (600x900)") || !strings.Contains(message, "image 2 is landscape (1600x900)") || !strings.Contains(message, "图片1是角色，图片2是场景") {
+	if !strings.Contains(message, "all 2 attached reference images") || !strings.Contains(message, "do not swap or merge their roles") || !strings.Contains(message, "does not reduce, replace, or override image 1's assigned semantic role") || !strings.Contains(message, "Every numbered reference remains equally authoritative") || strings.Contains(message, "orientation only") || !strings.Contains(message, "source material rather than loose inspiration") || !strings.Contains(message, "from crossing between reference numbers") || !strings.Contains(message, "image 1 is portrait (600x900)") || !strings.Contains(message, "image 2 is landscape (1600x900)") || !strings.Contains(message, "图片1是角色，图片2是场景") {
 		t.Fatalf("message=%q", message)
 	}
 	personality, _ := payload["customPersonality"].(string)
-	if !strings.Contains(personality, "precision image editor") || !strings.Contains(personality, "authoritative visual reference") {
+	if !strings.Contains(personality, "precision image-to-image editor") || !strings.Contains(personality, "authoritative source material") || !strings.Contains(personality, "reference-level fidelity") {
 		t.Fatalf("customPersonality=%q", personality)
+	}
+	if payload["enableSideBySide"] != false {
+		t.Fatalf("enableSideBySide=%#v", payload["enableSideBySide"])
 	}
 	metadata := payload["responseMetadata"].(map[string]any)
 	override := metadata["modelConfigOverride"].(map[string]any)
@@ -900,6 +960,29 @@ func TestBuildBasicImageEditPayloadKeepsMultiReferenceSemantics(t *testing.T) {
 	config := modelMap["imageGenModelConfig"].(map[string]any)
 	if config["aspectRatio"] != "9:16" {
 		t.Fatalf("image config=%#v", config)
+	}
+}
+
+func TestBasicImageEditAspectRatioInheritsFirstReference(t *testing.T) {
+	landscape := []provider.ImageInput{
+		{MIMEType: "image/png", Data: testPNG(t, 1600, 900)},
+		{MIMEType: "image/png", Data: testPNG(t, 600, 900)},
+	}
+	if got := basicImageEditAspectRatio("", landscape); got != "16:9" {
+		t.Fatalf("landscape ratio=%q", got)
+	}
+	if got := basicImageEditAspectRatio("auto", landscape); got != "16:9" {
+		t.Fatalf("auto landscape ratio=%q", got)
+	}
+	portrait := []provider.ImageInput{
+		{MIMEType: "image/png", Data: testPNG(t, 600, 900)},
+		{MIMEType: "image/png", Data: testPNG(t, 1600, 900)},
+	}
+	if got := basicImageEditAspectRatio("", portrait); got != "2:3" {
+		t.Fatalf("portrait ratio=%q", got)
+	}
+	if got := basicImageEditAspectRatio("9:16", landscape); got != "9:16" {
+		t.Fatalf("explicit ratio=%q", got)
 	}
 }
 

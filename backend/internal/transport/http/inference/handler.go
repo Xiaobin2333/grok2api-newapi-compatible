@@ -426,6 +426,13 @@ type imageRequestError struct {
 	Message string
 }
 
+func (e *imageRequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
 type imageEditOptions struct {
 	Count         int
 	Size          string
@@ -735,11 +742,14 @@ func (h *Handler) editImage(c *gin.Context) {
 	}
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
+		var referenceError *imageRequestError
 		switch {
 		case errors.As(err, &maxBytesError):
 			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "request_too_large", "图片编辑参考图超过请求大小限制")
 		case errors.Is(err, errImageEditMaskUnsupported):
 			writeOpenAIError(c, http.StatusBadRequest, "unsupported_parameter", err.Error())
+		case errors.As(err, &referenceError):
+			writeOpenAIError(c, http.StatusBadRequest, referenceError.Code, referenceError.Message)
 		default:
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request", "图片编辑请求无效: "+err.Error())
 		}
@@ -835,8 +845,14 @@ func parseImageEditMultipart(c *gin.Context, maxBodyBytes int64) (imageEditJSONR
 	}
 	for _, field := range []string{"image", "image[]", "images", "images[]"} {
 		for _, value := range form.Value[field] {
-			if err := appendReference(value); err != nil {
+			values, err := parseMultipartImageReferenceValues(value)
+			if err != nil {
 				return imageEditJSONRequest{}, nil, err
+			}
+			for _, reference := range values {
+				if err := appendReference(reference); err != nil {
+					return imageEditJSONRequest{}, nil, err
+				}
 			}
 		}
 		for _, header := range form.File[field] {
@@ -851,12 +867,38 @@ func parseImageEditMultipart(c *gin.Context, maxBodyBytes int64) (imageEditJSONR
 	}
 	for _, field := range []string{"image_urls", "image_urls[]"} {
 		for _, value := range form.Value[field] {
-			if err := appendReference(value); err != nil {
+			values, err := parseMultipartImageReferenceValues(value)
+			if err != nil {
 				return imageEditJSONRequest{}, nil, err
+			}
+			for _, reference := range values {
+				if err := appendReference(reference); err != nil {
+					return imageEditJSONRequest{}, nil, err
+				}
 			}
 		}
 	}
 	return request, references, nil
+}
+
+func parseMultipartImageReferenceValues(value string) ([]string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, errors.New("参考图字段为空")
+	}
+	switch value[0] {
+	case '[', '{', '"':
+		if !json.Valid([]byte(value)) {
+			return nil, errors.New("参考图 JSON 无效")
+		}
+		values, err := parseImageReferenceField(json.RawMessage(value), value[0] == '[')
+		if err != nil {
+			return nil, err
+		}
+		return values, nil
+	default:
+		return []string{value}, nil
+	}
 }
 
 func firstMultipartValue(form *multipart.Form, field string) string {
