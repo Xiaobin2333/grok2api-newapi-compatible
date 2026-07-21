@@ -225,7 +225,7 @@ func TestRecoverVideoJobsRetriesUsageWithoutRegeneratingVideo(t *testing.T) {
 		ID: "video_usage_recovery", RequestID: "request-usage-recovery",
 		ClientKeyID: 1, ClientKeyName: "client", AccountID: 2, AccountName: "account",
 		Provider: "grok_web", Model: "grok-imagine-video", ModelRouteID: 3, UpstreamModel: "video",
-		Seconds: 8, Quality: "720p", Status: media.StatusCompleted, InputJSON: `{}`, CreatedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt,
+		Seconds: 8, Quality: "720p", Status: media.StatusCompleted, InputImageCount: 2, CreatedAt: completedAt.Add(-time.Minute), CompletedAt: &completedAt,
 	}}
 	recorder := &durableVideoAuditRecorder{failures: 1}
 	service := &Service{mediaJobs: repository, audits: recorder}
@@ -241,8 +241,21 @@ func TestRecoverVideoJobsRetriesUsageWithoutRegeneratingVideo(t *testing.T) {
 	if repository.job.UsageRecordedAt == nil || recorder.calls != 2 {
 		t.Fatalf("recordedAt = %v, audit calls = %d", repository.job.UsageRecordedAt, recorder.calls)
 	}
-	if recorder.last.EventID != "video_usage_video_usage_recovery" || recorder.last.EstimatedCostInUSDTicks <= 0 {
+	if recorder.last.EventID != "video_usage_video_usage_recovery" || recorder.last.EstimatedCostInUSDTicks <= 0 || recorder.last.MediaInputImages != 2 {
 		t.Fatalf("audit = %#v", recorder.last)
+	}
+}
+
+func TestEncodeVideoInputEnforcesPersistedLimit(t *testing.T) {
+	service := &Service{logger: slog.Default()}
+	withinLimit := "https://example.com/" + strings.Repeat("A", media.MaxInputJSONBytes-256)
+	encoded, _, err := service.prepareVideoInput(context.Background(), []VideoReference{{URL: withinLimit}}, false, "")
+	if err != nil || len(encoded) > media.MaxInputJSONBytes {
+		t.Fatalf("encoded len=%d err=%v", len(encoded), err)
+	}
+	overLimit := "https://example.com/" + strings.Repeat("A", media.MaxInputJSONBytes)
+	if _, _, err := service.prepareVideoInput(context.Background(), []VideoReference{{URL: overLimit}}, false, ""); !errors.Is(err, ErrVideoInputTooLarge) {
+		t.Fatalf("oversized input error = %v", err)
 	}
 }
 
@@ -291,6 +304,42 @@ func TestRecoverVideoJobsRecordsDetachedAccountSnapshot(t *testing.T) {
 		t.Fatalf("detached account audit = %#v", recorder.last)
 	}
 }
+
+func TestLogVideoGenerationFailurePreservesUpstreamDiagnostic(t *testing.T) {
+	var output bytes.Buffer
+	service := &Service{logger: slog.New(slog.NewTextHandler(&output, nil))}
+	nodeID := uint64(7)
+	service.logVideoGenerationFailure(media.Job{
+		ID: "video_failure", RequestID: "request-failure", UpstreamModel: "grok-imagine-video",
+		EgressNodeID: &nodeID, EgressNodeName: "proxy-1", EgressScope: "grok_web", EgressMode: "proxy",
+	}, account.Credential{ID: 42, Provider: account.ProviderWeb}, videoStatusError{
+		status:  http.StatusForbidden,
+		message: "Grok Web 媒体上游返回 403: upload denied access_token=secret https://assets.grok.com/video?token=secret",
+	})
+	logLine := output.String()
+	for _, expected := range []string{
+		"msg=video_generation_failed", "job_id=video_failure", "request_id=request-failure",
+		"account_id=42", "provider=grok_web", "upstream_status=403", "upload denied",
+		"egress_node_id=7", "egress_node_name=proxy-1",
+	} {
+		if !strings.Contains(logLine, expected) {
+			t.Fatalf("log missing %q: %s", expected, logLine)
+		}
+	}
+	for _, secret := range []string{"access_token=secret", "token=secret"} {
+		if strings.Contains(logLine, secret) {
+			t.Fatalf("log exposed %q: %s", secret, logLine)
+		}
+	}
+}
+
+type videoStatusError struct {
+	status  int
+	message string
+}
+
+func (e videoStatusError) Error() string       { return e.message }
+func (e videoStatusError) HTTPStatusCode() int { return e.status }
 
 func TestVideoQueueIsBoundedAndDeduplicated(t *testing.T) {
 	service := &Service{}

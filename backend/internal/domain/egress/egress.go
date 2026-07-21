@@ -25,6 +25,7 @@ type Node struct {
 	Scope                       Scope
 	Enabled                     bool
 	ForceNoCooldown             bool
+	ProxyPool                   bool
 	EncryptedProxyURL           string
 	UserAgent                   string
 	EncryptedCloudflareCookie   string
@@ -46,6 +47,7 @@ type PublicNode struct {
 	Enabled           bool
 	ForceNoCooldown   bool
 	ProxyConfigured   bool
+	ProxyPool         bool
 	UserAgent         string
 	CookieConfigured  bool
 	AccountBoundProxy bool
