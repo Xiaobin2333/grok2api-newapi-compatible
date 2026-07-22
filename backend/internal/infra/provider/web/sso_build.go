@@ -67,10 +67,10 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	}
 	seed, err := flow.convert(requestCtx, credential)
 	if err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, conversionStatus(err), err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, conversionStatus(err), err)
 		return provider.CredentialSeed{}, err
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 	return seed, nil
 }
 

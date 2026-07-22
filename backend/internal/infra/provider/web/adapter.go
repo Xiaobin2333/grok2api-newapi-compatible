@@ -7,7 +7,6 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	modeldomain "github.com/chenyme/grok2api/backend/internal/domain/model"
-	configinfra "github.com/chenyme/grok2api/backend/internal/infra/config"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -63,10 +62,10 @@ func normalizedConfig(cfg Config) Config {
 		cfg.BaseURL = "https://grok.com"
 	}
 	if cfg.StatsigMode == "" {
-		cfg.StatsigMode = configinfra.StatsigModeLocal
+		cfg.StatsigMode = "url"
 	}
-	if cfg.StatsigMode == configinfra.StatsigModeLocal {
-		cfg.StatsigSignerURL = ""
+	if cfg.StatsigSignerURL == "" {
+		cfg.StatsigSignerURL = defaultStatsigSignerURL
 	}
 	if cfg.QuotaTimeoutSeconds <= 0 {
 		cfg.QuotaTimeoutSeconds = 25

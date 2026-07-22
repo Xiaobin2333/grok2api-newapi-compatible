@@ -285,6 +285,62 @@ func TestGatewayFailsOverBeforeReturningBody(t *testing.T) {
 	}
 }
 
+func TestGatewayRetriesWebAntiBotOnceThenFallsBackToNextAccount(t *testing.T) {
+	service, adapter, clientKey, credentials, cleanup := newWebAntiBotGatewayFixture(t, 3, 2)
+	defer cleanup()
+	adapter.successID = credentials[1].ID
+
+	result, err := service.CreateResponse(context.Background(), Input{
+		RequestID: "req-web-antibot-fixed", ClientKey: clientKey, PublicModel: "grok-antibot",
+		Body: []byte(`{"model":"grok-antibot","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer result.Body.Close()
+	if body, readErr := io.ReadAll(result.Body); readErr != nil || string(body) != "ok" {
+		t.Fatalf("body=%q err=%v", body, readErr)
+	}
+	result.Finalize(Usage{}, "resp-web-antibot", "")
+	attempts := adapter.Attempts()
+	want := []uint64{credentials[0].ID, credentials[0].ID, credentials[1].ID}
+	if len(attempts) != len(want) {
+		t.Fatalf("attempts=%#v want=%#v", attempts, want)
+	}
+	for index := range want {
+		if attempts[index] != want[index] {
+			t.Fatalf("attempts=%#v want=%#v", attempts, want)
+		}
+	}
+}
+
+func TestGatewayAllAccountModeVisitsEachWebAccountOnceAfterAntiBot(t *testing.T) {
+	service, adapter, clientKey, credentials, cleanup := newWebAntiBotGatewayFixture(t, 0, 3)
+	defer cleanup()
+
+	_, err := service.CreateResponse(context.Background(), Input{
+		RequestID: "req-web-antibot-all", ClientKey: clientKey, PublicModel: "grok-antibot",
+		Body: []byte(`{"model":"grok-antibot","input":"hello"}`),
+	})
+	var failure *UpstreamFailure
+	if !errors.As(err, &failure) || failure.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("error=%T %v", err, err)
+	}
+	attempts := adapter.Attempts()
+	if len(attempts) != len(credentials) {
+		t.Fatalf("attempts=%#v credentials=%d", attempts, len(credentials))
+	}
+	seen := make(map[uint64]int, len(attempts))
+	for _, accountID := range attempts {
+		seen[accountID]++
+	}
+	for _, credential := range credentials {
+		if seen[credential.ID] != 1 {
+			t.Fatalf("account %d attempts=%d all=%#v", credential.ID, seen[credential.ID], attempts)
+		}
+	}
+}
+
 func TestGatewaySSOUnauthorizedMarksInvalidAndSwitchesAccount(t *testing.T) {
 	for _, providerValue := range []account.Provider{account.ProviderWeb, account.ProviderConsole} {
 		providerValue := providerValue
@@ -1600,9 +1656,96 @@ type webChatQuotaAdapter struct {
 	synced chan string
 }
 
+type webAntiBotAdapter struct {
+	mu        sync.Mutex
+	attempts  []uint64
+	successID uint64
+}
+
 type credentialFailureImageAdapter struct {
 	generationCalls atomic.Int64
 	refreshCalls    atomic.Int64
+}
+
+func newWebAntiBotGatewayFixture(t *testing.T, maxAttempts, accountCount int) (*Service, *webAntiBotAdapter, clientkey.Key, []account.Credential, func()) {
+	t.Helper()
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "web-antibot.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.InitializeSchema(ctx); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+	credentials := make([]account.Credential, 0, accountCount)
+	for index := 0; index < accountCount; index++ {
+		name := fmt.Sprintf("web-antibot-%d", index+1)
+		credential, _, createErr := accountRepo.UpsertByIdentity(ctx, account.Credential{
+			Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, WebTier: account.WebTierBasic,
+			Name: name, SourceKey: name, EncryptedAccessToken: "encrypted-" + name,
+			ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+			Priority: 300 - index, MaxConcurrent: 1,
+		})
+		if createErr != nil {
+			_ = database.Close()
+			t.Fatal(createErr)
+		}
+		credentials = append(credentials, credential)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderWeb, []string{"grok-antibot"}); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	for _, credential := range credentials {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-antibot"}, time.Now().UTC()); err != nil {
+			_ = database.Close()
+			t.Fatal(err)
+		}
+	}
+	key, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "web-antibot-key", Prefix: "web-antibot", SecretHash: strings.Repeat("f", 64), EncryptedSecret: "encrypted-key",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	adapter := &webAntiBotAdapter{}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, maxAttempts)
+	return service, adapter, key, credentials, func() { _ = database.Close() }
+}
+
+func (a *webAntiBotAdapter) Provider() account.Provider { return account.ProviderWeb }
+func (a *webAntiBotAdapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderWeb)
+}
+func (a *webAntiBotAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	success := a.successID != 0 && request.Credential.ID == a.successID
+	a.mu.Unlock()
+	if success {
+		return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader(`{"error":{"code":"anti_bot_rejected","message":"Grok Web anti-bot rejection"}}`)),
+	}, nil
+}
+func (a *webAntiBotAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
 }
 
 func (a *credentialFailureImageAdapter) Provider() account.Provider { return account.ProviderBuild }

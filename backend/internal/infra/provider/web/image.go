@@ -403,12 +403,13 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 			body, _ := io.ReadAll(io.LimitReader(upstream.Body, 1<<20))
 			_ = upstream.Body.Close()
 			if upstream.StatusCode == http.StatusForbidden {
-				if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+				if attempt == 0 {
+					a.feedbackAntiBot(ctx, lease, statsigTarget)
 					lease.Release()
 					continue
 				}
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, upstream.StatusCode, nil)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, upstream.StatusCode, nil)
 			lease.Release()
 			return "", &liteUpstreamError{StatusCode: upstream.StatusCode, Status: upstream.Status, Body: body}
 		}
@@ -437,12 +438,13 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 			status := 0
 			if errors.Is(consumeErr, errWebAntiBot) {
 				status = http.StatusForbidden
-				if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+				if attempt == 0 {
+					a.feedbackAntiBot(ctx, lease, statsigTarget)
 					lease.Release()
 					continue
 				}
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, status, consumeErr)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, status, consumeErr)
 			lease.Release()
 			if status == http.StatusForbidden {
 				response := antiBotProviderResponse()
@@ -452,7 +454,7 @@ func (a *Adapter) generateLiteImageURL(ctx context.Context, credential account.C
 			}
 			return "", consumeErr
 		}
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 		lease.Release()
 		if firstImage != "" {
 			return firstImage, nil
@@ -618,7 +620,7 @@ func (a *Adapter) generateWSImage(ctx context.Context, request provider.ImageGen
 		if response != nil {
 			status = response.StatusCode
 		}
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, status, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, status, err)
 		return nil, fmt.Errorf("连接 Imagine WebSocket: %w", err)
 	}
 	connectionOwned := true
@@ -632,12 +634,12 @@ func (a *Adapter) generateWSImage(ctx context.Context, request provider.ImageGen
 	_ = connection.SetReadDeadline(deadline)
 	_ = connection.SetWriteDeadline(deadline)
 	if err := connection.WriteJSON(imagineResetMessage()); err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		return nil, err
 	}
 	upstreamCount := imagineUpstreamGenerationCount(request.Streaming, count, modelConfig)
 	if err := connection.WriteJSON(imagineRequestMessage(newWebID("img"), request.Prompt, ratio, cfg.AllowNSFW, modelConfig.Pro, upstreamCount)); err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		return nil, err
 	}
 	if request.Streaming {
@@ -653,7 +655,7 @@ func (a *Adapter) generateWSImage(ctx context.Context, request provider.ImageGen
 	for collector.UsableCount() < count && !collector.Done(modelConfig.NativeBatchSize) {
 		messageType, data, readErr := connection.ReadMessage()
 		if readErr != nil {
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, readErr)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, readErr)
 			return nil, fmt.Errorf("读取 Imagine WebSocket: %w", readErr)
 		}
 		if messageType != websocket.TextMessage {
@@ -665,12 +667,12 @@ func (a *Adapter) generateWSImage(ctx context.Context, request provider.ImageGen
 		}
 		if message["type"] == "error" {
 			upstreamErr := fmt.Errorf("Imagine WebSocket 返回错误")
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, upstreamErr)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, upstreamErr)
 			return nil, upstreamErr
 		}
 		collector.Accept(message)
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 	images := collector.Images()
 	if len(images) == 0 {
 		return nil, fmt.Errorf("Imagine WebSocket 完成但没有可用图片")
@@ -888,6 +890,7 @@ func (a *Adapter) editBasicImageViaChat(ctx context.Context, request provider.Im
 				"type":    "rate_limit_error", "code": "usage_limit_reached",
 			}})
 		case errors.Is(consumeErr, errWebAntiBot):
+			a.feedbackAntiBot(ctx, lease, cfg.BaseURL+"/rest/app-chat/conversations/new")
 			result = antiBotProviderResponse()
 		default:
 			result = jsonProviderResponse(http.StatusBadGateway, map[string]any{"error": map[string]any{
@@ -1297,14 +1300,14 @@ func (a *Adapter) streamImageEdit(
 		return nil
 	})
 	if consumeErr != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, consumeErr)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, consumeErr)
 		_ = writer.CloseWithError(consumeErr)
 		return
 	}
 	urls := imageEditResultURLs(&parsed, capture.Bytes())
 	if len(urls) == 0 {
 		err := fmt.Errorf("上游未返回可用的编辑图片")
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		_ = writer.CloseWithError(err)
 		return
 	}
@@ -1323,7 +1326,7 @@ func (a *Adapter) streamImageEdit(
 		_ = writer.CloseWithError(err)
 		return
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 	_ = writer.Close()
 }
 
@@ -1586,7 +1589,7 @@ func (a *Adapter) uploadFileV2Direct(ctx context.Context, cfg Config, lease *egr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		if response.StatusCode == http.StatusForbidden {
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 		}
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, directFileUploadResponseLimit))
 		return uploadedFile{}, fmt.Errorf("V2 上传文件返回 %d", response.StatusCode)
@@ -1782,11 +1785,12 @@ func (a *Adapter) postJSONWithReferer(ctx context.Context, cfg Config, lease *eg
 		}
 		if response.StatusCode == http.StatusForbidden {
 			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
+				a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusForbidden, nil)
 				_ = response.Body.Close()
 				cancel()
 				continue
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusForbidden, nil)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusForbidden, nil)
 		}
 		response.Body = &cancelBody{ReadCloser: response.Body, cancel: cancel}
 		return response, nil
@@ -1882,7 +1886,7 @@ func (a *Adapter) streamImagineImages(ctx context.Context, writer *io.PipeWriter
 				_ = writer.CloseWithError(ctx.Err())
 				return
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, readErr)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, readErr)
 			_ = writer.CloseWithError(readErr)
 			return
 		}
@@ -1895,7 +1899,7 @@ func (a *Adapter) streamImagineImages(ctx context.Context, writer *io.PipeWriter
 		}
 		if message["type"] == "error" {
 			upstreamErr := fmt.Errorf("Imagine WebSocket 返回错误")
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, upstreamErr)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, upstreamErr)
 			_ = writer.CloseWithError(upstreamErr)
 			return
 		}
@@ -1945,7 +1949,7 @@ func (a *Adapter) streamImagineImages(ctx context.Context, writer *io.PipeWriter
 			return
 		}
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 	_ = writer.Close()
 }
 
@@ -2031,12 +2035,12 @@ func (a *Adapter) downloadImageAttempt(ctx context.Context, credential account.C
 	request.Header.Del("Content-Type")
 	response, err := lease.Do(request)
 	if err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		return nil, ctx.Err() == nil, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 		retryable := response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooEarly || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500
 		return nil, retryable, fmt.Errorf("下载图片返回 %d", response.StatusCode)
 	}
@@ -2046,13 +2050,13 @@ func (a *Adapter) downloadImageAttempt(ctx context.Context, credential account.C
 	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, (32<<20)+1))
 	if err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		return nil, ctx.Err() == nil, fmt.Errorf("读取图片内容: %w", err)
 	}
 	if len(raw) > 32<<20 {
 		return nil, false, fmt.Errorf("图片下载超过 32 MiB")
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 	return raw, false, nil
 }
 

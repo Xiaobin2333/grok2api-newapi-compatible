@@ -214,51 +214,51 @@ func TestStatsigManualValueIsWriteOnlyAndClearedByURLMode(t *testing.T) {
 
 	urlMode := service.Get().Config
 	urlMode.ProviderWeb.StatsigMode = config.StatsigModeURL
-	urlMode.ProviderWeb.StatsigSignerURL = "http://grok-signer-go:8788/sign"
 	if _, err := service.Update(context.Background(), service.Get().Revision, urlMode); err != nil {
 		t.Fatal(err)
 	}
 	if repository.value.ProviderWeb.StatsigManualValue != "" {
 		t.Fatal("URL mode retained the manual x-statsig-id")
 	}
+}
 
-	localMode := service.Get().Config
-	localMode.ProviderWeb.StatsigMode = config.StatsigModeLocal
-	if _, err := service.Update(context.Background(), service.Get().Revision, localMode); err != nil {
-		t.Fatal(err)
-	}
-	if repository.value.ProviderWeb.StatsigSignerURL != "" {
-		t.Fatal("local mode retained the URL signer")
+func TestLoadPersistedMigratesLegacyStatsigModesToRemoteSigner(t *testing.T) {
+	for _, legacyMode := range []string{"", "local"} {
+		t.Run(legacyMode, func(t *testing.T) {
+			cfg := testConfig(t)
+			value := toDomainConfig(cfg)
+			value.ProviderWeb.StatsigMode = legacyMode
+			value.ProviderWeb.StatsigManualValue = base64.RawStdEncoding.EncodeToString(make([]byte, 70))
+			value.ProviderWeb.StatsigSignerURL = ""
+			repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+
+			loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.Provider.Web.StatsigMode != config.StatsigModeURL || loaded.Provider.Web.StatsigSignerURL != config.DefaultStatsigSignerURL {
+				t.Fatalf("Statsig config = %#v", loaded.Provider.Web)
+			}
+			if loaded.Provider.Web.StatsigManualValue != "" {
+				t.Fatal("legacy Statsig migration retained a manual value")
+			}
+		})
 	}
 }
 
-func TestLoadPersistedMigratesIncompleteStatsigPayloadToLocal(t *testing.T) {
-	cfg := testConfig(t)
-	value := toDomainConfig(cfg)
-	value.ProviderWeb.StatsigMode = ""
-	value.ProviderWeb.StatsigSignerURL = ""
-	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
-	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if loaded.Provider.Web.StatsigMode != config.StatsigModeLocal || loaded.Provider.Web.StatsigSignerURL != "" {
-		t.Fatalf("Statsig mode=%q signer=%q", loaded.Provider.Web.StatsigMode, loaded.Provider.Web.StatsigSignerURL)
-	}
-}
-
-func TestLoadPersistedMigratesRetiredStatsigSignerToLocal(t *testing.T) {
+func TestLoadPersistedBackfillsMissingRemoteStatsigSignerURL(t *testing.T) {
 	cfg := testConfig(t)
 	value := toDomainConfig(cfg)
 	value.ProviderWeb.StatsigMode = config.StatsigModeURL
-	value.ProviderWeb.StatsigSignerURL = config.DefaultStatsigSignerURL
+	value.ProviderWeb.StatsigSignerURL = ""
 	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+
 	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Provider.Web.StatsigMode != config.StatsigModeLocal || loaded.Provider.Web.StatsigSignerURL != "" {
-		t.Fatalf("Statsig mode=%q signer=%q", loaded.Provider.Web.StatsigMode, loaded.Provider.Web.StatsigSignerURL)
+	if loaded.Provider.Web.StatsigSignerURL != config.DefaultStatsigSignerURL {
+		t.Fatalf("Statsig signer URL = %q", loaded.Provider.Web.StatsigSignerURL)
 	}
 }
 

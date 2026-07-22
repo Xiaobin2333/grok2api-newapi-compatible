@@ -675,7 +675,7 @@ func TestFlareSolverrPrewarmsDirectWebEgressWhenNoNodesExist(t *testing.T) {
 	}
 }
 
-func TestStickyProxyForbiddenDoesNotCooldownSharedNode(t *testing.T) {
+func TestStickyProxyForbiddenRebuildsRejectedSessionWithoutCoolingSharedNode(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
 		t.Fatal(err)
@@ -686,14 +686,36 @@ func TestStickyProxyForbiddenDoesNotCooldownSharedNode(t *testing.T) {
 	}
 	repository := &mutableEgressRepository{node: domain.Node{ID: 1, Name: "resin", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: proxy}}
 	manager := NewManager(repository, cipher)
-	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 42, Provider: accountdomain.ProviderWeb})
+	first, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 42, Provider: accountdomain.ProviderWeb})
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease.Release()
-	manager.Feedback(context.Background(), 1, http.StatusForbidden, nil)
+	second, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 43, Provider: accountdomain.ProviderWeb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClient, secondClient := first.client, second.client
+	first.Release()
+	second.Release()
+	manager.FeedbackLease(context.Background(), first, http.StatusForbidden, nil)
 	if repository.updates != 0 || repository.node.Health != 1 || repository.node.LastError != "" {
 		t.Fatalf("sticky proxy 403 changed shared node: updates=%d node=%#v", repository.updates, repository.node)
+	}
+	firstRetry, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 42, Provider: accountdomain.ProviderWeb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstRetry.Release()
+	secondRetry, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 43, Provider: accountdomain.ProviderWeb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondRetry.Release()
+	if firstRetry.client == firstClient {
+		t.Fatal("rejected account reused its anti-bot browser session")
+	}
+	if secondRetry.client != secondClient {
+		t.Fatal("anti-bot feedback evicted another account's browser session")
 	}
 }
 

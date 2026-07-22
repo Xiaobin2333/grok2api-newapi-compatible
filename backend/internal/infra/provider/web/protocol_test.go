@@ -1284,6 +1284,16 @@ func TestPreflightClassifiesAntiBotRejection(t *testing.T) {
 	}
 }
 
+func TestVideoStreamClassifiesAntiBotRejection(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`data: {"error":{"message":"Request rejected by anti-bot rules.","code":7,"details":[]}}` + "\n")),
+	}
+	if _, _, err := parseVideoStream(response, nil); !errors.Is(err, errWebAntiBot) {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestImagineRequestContainsOnlyProtocolProperties(t *testing.T) {
 	message := imagineRequestMessage("request", "prompt", "16:9", false, true, 8)
 	item := message["item"].(map[string]any)

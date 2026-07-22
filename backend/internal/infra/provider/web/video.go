@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -178,6 +179,9 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	result, _, parseErr := parseVideoStream(response, request.Progress)
 	_ = response.Body.Close()
 	if parseErr != nil {
+		if errors.Is(parseErr, errWebAntiBot) {
+			a.feedbackAntiBot(ctx, lease, cfg.BaseURL+"/rest/app-chat/conversations/new")
+		}
 		return provider.VideoResult{}, parseErr
 	}
 	if result.URL == "" {
@@ -329,6 +333,9 @@ func parseVideoStream(response *http.Response, progress func(int)) (provider.Vid
 }
 
 func webMediaStreamError(value map[string]any) error {
+	if classified := webResponseError(value); errors.Is(classified, errWebAntiBot) {
+		return classified
+	}
 	message := safeWebMediaDiagnostic(firstString(value, "message", "error", "detail"), webMediaDiagnosticFieldLimit)
 	if message == "" {
 		message = "未提供错误详情"

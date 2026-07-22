@@ -181,7 +181,8 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 		previous = currentPrevious
 		if upstream.StatusCode < 200 || upstream.StatusCode >= 300 {
 			if upstream.StatusCode == http.StatusForbidden {
-				if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+				if attempt == 0 {
+					a.feedbackAntiBot(ctx, lease, statsigTarget)
 					a.releaseStatsigRetry(upstream, lease)
 					continue
 				}
@@ -190,7 +191,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				StatusCode: upstream.StatusCode, Status: upstream.Status, Header: http.Header(upstream.Header),
 				UpstreamURL: responseUpstreamURL(upstream),
 				Body: &releaseBody{ReadCloser: upstream.Body, release: func() {
-					a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, upstream.StatusCode, nil)
+					a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, upstream.StatusCode, nil)
 					lease.Release()
 				}},
 			}, nil
@@ -202,7 +203,8 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				body := a.streamOpenAIResponse(ctx, prepared, lease, request.Credential, responseID, input.Model, request.Operation, normalized.Prompt, previous, tools, parallelTools, conversationOptions)
 				return &provider.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: streamHeaders(), Body: body}, nil
 			}
-			if errors.Is(preflightErr, errWebAntiBot) && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+			if errors.Is(preflightErr, errWebAntiBot) && attempt == 0 {
+				a.feedbackAntiBot(ctx, lease, statsigTarget)
 				a.releaseStatsigRetry(upstream, lease)
 				continue
 			}
@@ -217,7 +219,8 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 
 		currentParsed, consumeErr := consumeUpstream(upstream.Body, nil)
 		_ = upstream.Body.Close()
-		if errors.Is(consumeErr, errWebAntiBot) && attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, statsigTarget) {
+		if errors.Is(consumeErr, errWebAntiBot) && attempt == 0 {
+			a.feedbackAntiBot(ctx, lease, statsigTarget)
 			lease.Release()
 			continue
 		}
@@ -227,10 +230,10 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 				a.feedbackAntiBot(ctx, lease, statsigTarget)
 				return antiBotProviderResponse(), nil
 			}
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, consumeErr)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, consumeErr)
 			return nil, consumeErr
 		}
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 		parsed = currentParsed
 		break
 	}
@@ -259,8 +262,19 @@ func (a *Adapter) releaseStatsigRetry(upstream *http.Response, lease *infraegres
 }
 
 func (a *Adapter) feedbackAntiBot(ctx context.Context, lease *infraegress.Lease, statsigTarget string) {
-	a.invalidateSignedStatsig(http.MethodPost, statsigTarget)
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusForbidden, nil)
+	statsigInvalidated := a.invalidateSignedStatsig(http.MethodPost, statsigTarget)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusForbidden, nil)
+	path := ""
+	if parsed, err := url.Parse(statsigTarget); err == nil {
+		path = parsed.EscapedPath()
+	}
+	a.log().Warn(
+		"web_antibot_rejected",
+		"egress_node_id", lease.NodeID,
+		"egress_node", lease.NodeName,
+		"path", path,
+		"statsig_invalidated", statsigInvalidated,
+	)
 }
 
 func preflightUpstream(source io.ReadCloser) (io.ReadCloser, error) {
@@ -348,7 +362,7 @@ func (a *Adapter) openChat(ctx context.Context, credential account.Credential, p
 	response, err := lease.Do(request)
 	if err != nil {
 		cancel()
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		lease.Release()
 		return nil, nil, nil, "", err
 	}
@@ -439,7 +453,7 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 			return writeWebStreamDelta(writer, messagesStream, operation, responseID, model, kind, delta)
 		})
 		if err != nil {
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 			_ = writer.CloseWithError(err)
 			return
 		}
@@ -483,7 +497,7 @@ func (a *Adapter) streamOpenAIResponse(ctx context.Context, source io.ReadCloser
 		}
 		parsed.Text.Reset()
 		parsed.Text.WriteString(clientText.String())
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, http.StatusOK, nil)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusOK, nil)
 		payload := buildOpenAIResult(operation, responseID, model, *parsed, false, options)
 		data, _ := json.Marshal(payload)
 		if operation == conversation.OperationResponses {

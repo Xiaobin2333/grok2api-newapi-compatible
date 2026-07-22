@@ -302,7 +302,7 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if clearanceRefresh <= 0 {
 		clearanceRefresh = base.Provider.Web.ClearanceRefresh.Value()
 	}
-	statsigMode, statsigSignerURL := config.NormalizeLegacyStatsig(value.ProviderWeb.StatsigMode, value.ProviderWeb.StatsigSignerURL)
+	statsigMode, statsigSignerURL := normalizePersistedStatsig(value.ProviderWeb.StatsigMode, value.ProviderWeb.StatsigSignerURL)
 	statsigManualValue := value.ProviderWeb.StatsigManualValue
 	if statsigMode != config.StatsigModeManual {
 		statsigManualValue = ""
@@ -366,6 +366,20 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	base.Accounts.AutoCleanReauthEnabled = value.Accounts.AutoCleanReauthEnabled
 	base.Accounts.AutoCleanIncludeDisabled = value.Accounts.AutoCleanIncludeDisabled
 	return base
+}
+
+// normalizePersistedStatsig keeps settings written by the short-lived local
+// signer release loadable after returning to remote or manual signatures.
+func normalizePersistedStatsig(mode, signerURL string) (string, string) {
+	mode = strings.TrimSpace(mode)
+	signerURL = strings.TrimSpace(signerURL)
+	if mode == "" || mode == "local" {
+		return config.StatsigModeURL, config.DefaultStatsigSignerURL
+	}
+	if mode == config.StatsigModeURL && signerURL == "" {
+		signerURL = config.DefaultStatsigSignerURL
+	}
+	return mode, signerURL
 }
 
 func toDomainConfig(value config.Config) settingsdomain.Config {
@@ -458,9 +472,6 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Provider.Web.BaseURL = strings.TrimSpace(input.ProviderWeb.BaseURL)
 	next.Provider.Web.StatsigMode = strings.TrimSpace(input.ProviderWeb.StatsigMode)
 	next.Provider.Web.StatsigSignerURL = strings.TrimSpace(input.ProviderWeb.StatsigSignerURL)
-	if next.Provider.Web.StatsigMode == config.StatsigModeLocal {
-		next.Provider.Web.StatsigSignerURL = ""
-	}
 	if input.ProviderWeb.ClearanceProvided {
 		next.Provider.Web.ClearanceMode = strings.TrimSpace(input.ProviderWeb.ClearanceMode)
 		next.Provider.Web.FlareSolverrURL = strings.TrimSpace(input.ProviderWeb.FlareSolverrURL)

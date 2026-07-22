@@ -152,7 +152,7 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 		a.applySignedStatsig(requestCtx, request, token, lease)
 		response, err = lease.Do(request)
 		if err != nil {
-			a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+			a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 			return account.QuotaWindow{}, err
 		}
 		body, err = io.ReadAll(io.LimitReader(response.Body, 4<<20))
@@ -162,19 +162,20 @@ func (a *Adapter) SyncQuotaMode(ctx context.Context, credential account.Credenti
 		}
 		if response.StatusCode == http.StatusForbidden {
 			if attempt == 0 && a.invalidateSignedStatsig(http.MethodPost, endpoint) {
+				a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, http.StatusForbidden, nil)
 				continue
 			}
 		}
 		break
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 		if response.StatusCode == http.StatusUnauthorized {
 			return account.QuotaWindow{}, provider.ErrUnauthorized
 		}
 		return account.QuotaWindow{}, fmt.Errorf("Grok Web 额度接口返回 %d", response.StatusCode)
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 	var value struct {
 		WindowSizeSeconds int `json:"windowSizeSeconds"`
 		RemainingQueries  int `json:"remainingQueries"`
@@ -224,7 +225,7 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 
 	response, err := lease.Do(request)
 	if err != nil {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, 0, err)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, 0, err)
 		return account.QuotaWindow{}, err
 	}
 	defer response.Body.Close()
@@ -233,7 +234,7 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 		return account.QuotaWindow{}, err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+		a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 		if response.StatusCode == http.StatusUnauthorized {
 			return account.QuotaWindow{}, provider.ErrUnauthorized
 		}
@@ -243,7 +244,7 @@ func (a *Adapter) syncWeeklyCredits(ctx context.Context, credential account.Cred
 	if err != nil {
 		return account.QuotaWindow{}, err
 	}
-	a.egress.Feedback(context.WithoutCancel(ctx), lease.NodeID, response.StatusCode, nil)
+	a.egress.FeedbackLease(context.WithoutCancel(ctx), lease, response.StatusCode, nil)
 	return window, nil
 }
 

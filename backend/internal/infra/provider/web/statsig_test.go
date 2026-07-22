@@ -68,6 +68,51 @@ func TestStatsigSignerRejectsInvalidShape(t *testing.T) {
 	}
 }
 
+func TestStatsigSignerFallsBackThroughWebEgressAfterDirectRejection(t *testing.T) {
+	raw := make([]byte, 70)
+	raw[0] = 7
+	encoded := base64.RawStdEncoding.EncodeToString(raw)
+	directCalls, fallbackCalls := 0, 0
+	signer := newStatsigSigner()
+	signer.validateEndpoint = func(context.Context, string) error { return nil }
+	signer.client = &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		directCalls++
+		return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader("challenge")), Header: http.Header{}}, nil
+	})}
+	signer.doViaLease = func(_ *infraegress.Lease, request *http.Request) (*http.Response, error) {
+		fallbackCalls++
+		if request.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("content type = %q", request.Header.Get("Content-Type"))
+		}
+		body, _ := json.Marshal(map[string]string{"x-statsig-id": encoded})
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(string(body))), Header: http.Header{}}, nil
+	}
+	value, err := signer.requestSignatureWithFallback(
+		context.Background(), "https://signer.example/sign", http.MethodPost, "/rest/test", "meta", &infraegress.Lease{},
+	)
+	if err != nil || value != encoded || directCalls != 1 || fallbackCalls != 1 {
+		t.Fatalf("value=%q direct=%d fallback=%d err=%v", value, directCalls, fallbackCalls, err)
+	}
+}
+
+func TestStatsigSignerDoesNotProxyPlainHTTPInternalSigner(t *testing.T) {
+	fallbackCalls := 0
+	signer := newStatsigSigner()
+	signer.validateEndpoint = func(context.Context, string) error { return nil }
+	signer.client = &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New("direct unavailable")
+	})}
+	signer.doViaLease = func(_ *infraegress.Lease, _ *http.Request) (*http.Response, error) {
+		fallbackCalls++
+		return nil, errors.New("unexpected fallback")
+	}
+	if _, err := signer.requestSignatureWithFallback(
+		context.Background(), "http://grok-signer-go:8788/sign", http.MethodPost, "/rest/test", "meta", &infraegress.Lease{},
+	); err == nil || fallbackCalls != 0 {
+		t.Fatalf("fallback=%d err=%v", fallbackCalls, err)
+	}
+}
+
 func TestValidateStatsigSignerEndpointUsesAdminURLBoundary(t *testing.T) {
 	for _, endpoint := range []string{
 		"https://grok.wodf.de/sign",
@@ -261,25 +306,6 @@ func TestApplySignedStatsigNeverLeavesRandomFallback(t *testing.T) {
 	}
 }
 
-func TestApplySignedStatsigLocalGeneratesFreshValidHeader(t *testing.T) {
-	adapter := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "local"}}
-	request, err := http.NewRequest(http.MethodPost, "https://grok.com/rest/app-chat/conversations/new", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	adapter.applySignedStatsig(context.Background(), request, "", nil)
-	first := request.Header.Get("x-statsig-id")
-	if !validStatsigID(first) {
-		t.Fatalf("invalid local x-statsig-id %q", first)
-	}
-	for attempt := 0; attempt < 8 && request.Header.Get("x-statsig-id") == first; attempt++ {
-		adapter.applySignedStatsig(context.Background(), request, "", nil)
-	}
-	if request.Header.Get("x-statsig-id") == first {
-		t.Fatal("local Statsig did not refresh its per-request mask")
-	}
-}
-
 func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 	manual := &Adapter{cfg: Config{StatsigMode: "manual"}, statsig: newStatsigSigner()}
 	if manual.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
@@ -288,9 +314,5 @@ func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 	urlMode := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "url", StatsigSignerURL: "https://signer.example/sign"}, statsig: newStatsigSigner()}
 	if !urlMode.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
 		t.Fatal("URL Statsig must be invalidated after anti-bot rejection")
-	}
-	local := &Adapter{cfg: Config{StatsigMode: "local"}, statsig: newStatsigSigner()}
-	if !local.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
-		t.Fatal("local Statsig must permit a fresh retry after anti-bot rejection")
 	}
 }

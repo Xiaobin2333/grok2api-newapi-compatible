@@ -191,6 +191,7 @@ func (s *Service) executeImage(
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
 	attemptPolicy := newAccountAttemptPolicy(int(s.maxAttempts.Load()))
 	excluded := make(map[uint64]bool)
+	egressRetryAttempted := make(map[uint64]bool)
 	var lease *accountLease
 	var credential accountdomain.Credential
 	var response *provider.Response
@@ -272,10 +273,14 @@ func (s *Service) executeImage(
 				lease.Release()
 				continue
 			}
-			if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && (attemptPolicy.allAccounts || attempt == 0) && attemptPolicy.hasNext(attempt) {
-				_, _ = readRetryableBody(response.Body)
+			if s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden && attemptPolicy.hasNext(attempt) {
+				body, _ := readRetryableBody(response.Body)
+				lastRetryableResponse = cloneLiteImageFailureResponse(response, body)
+				failedCredential := credential
+				lastCredentialFailure = &failedCredential
 				lease.Release()
-				if !attemptPolicy.allAccounts {
+				if !attemptPolicy.allAccounts && !egressRetryAttempted[credential.ID] {
+					egressRetryAttempted[credential.ID] = true
 					delete(excluded, credential.ID)
 				}
 				continue

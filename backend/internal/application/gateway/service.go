@@ -541,6 +541,7 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 		}
 	}
 	excluded := make(map[uint64]bool)
+	egressRetryAttempted := make(map[uint64]bool)
 	failureFingerprints := make(map[string]int)
 	authRecoveryAttempted := make(map[uint64]bool)
 	quotaMode := s.providers.QuotaMode(route.Provider, route.UpstreamModel)
@@ -687,20 +688,23 @@ attemptLoop:
 			}
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
-		finalEgressForbidden := egressForbidden && !attemptPolicy.allAccounts && (attempt > 0 || !attemptPolicy.hasNext(attempt))
-		if isRetryableResponse(response) && !finalEgressForbidden {
+		if isRetryableResponse(response) {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
-				// Web 403/code 7 表示出口浏览器会话被拒绝；Provider 已重建会话并降低节点健康，不应误伤账号。
-				// 固定次数模式允许同账号重试一次；全账号模式保持排除，确保每个账号只进入一次。
-				if !attemptPolicy.allAccounts {
+				// Web 403/code 7 表示出口浏览器会话被拒绝，不应误伤账号。固定次数模式先给
+				// 当前账号一次新出口机会，再切换账号；全账号模式保持每账号只进入一次。
+				if !attemptPolicy.allAccounts && !egressRetryAttempted[credential.ID] {
+					egressRetryAttempted[credential.ID] = true
 					delete(excluded, credential.ID)
 				}
 				lease.Release()
 				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
 				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
-				continue
+				if attemptPolicy.hasNext(attempt) {
+					continue
+				}
+				break
 			}
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 			// The adapter only allows auto Super accounts to fall back to XAI within the same request;

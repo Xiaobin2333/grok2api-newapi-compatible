@@ -243,6 +243,7 @@ func (s *Service) executeLiteImageUnit(
 		}
 
 		retryable := liteImageStatusRetryable(response.StatusCode)
+		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		if response.StatusCode == http.StatusUnauthorized && credential.AuthType == accountdomain.AuthTypeSSO {
 			s.markSSOCredentialRejected(ctx, credential, fmt.Sprintf("%s SSO credential rejected", credential.Provider))
 			retryable = true
@@ -251,7 +252,7 @@ func (s *Service) executeLiteImageUnit(
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			_, _ = s.accounts.ReconcileWebRateLimit(ctx, credential.ID, quotaMode, retryAfter)
 			s.selector.MarkQuotaStateChanged(credential.Provider)
-		} else if retryable {
+		} else if retryable && !egressForbidden {
 			s.selector.MarkFailure(ctx, credential, response.StatusCode, 0)
 		}
 		if retryable && policy.hasNext(attempt) {

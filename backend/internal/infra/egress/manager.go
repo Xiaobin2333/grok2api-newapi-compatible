@@ -41,6 +41,7 @@ type Lease struct {
 	UserAgent        string
 	CFCookies        string
 	client           requestClient
+	clientKey        clientCacheKey
 	browser          *browserClient
 	sticky           bool
 	proxyPool        bool
@@ -64,6 +65,16 @@ func (l *Lease) Do(request *http.Request) (*http.Response, error) {
 	}
 	return response, err
 }
+
+// DoAuxiliary reuses the lease's proxy and TLS profile for a supporting
+// service without treating that service's response as Grok clearance health.
+func (l *Lease) DoAuxiliary(request *http.Request) (*http.Response, error) {
+	if l == nil || l.client == nil {
+		return nil, errors.New("出口客户端未初始化")
+	}
+	return l.do(request)
+}
+
 func (l *Lease) Release() {
 	if l != nil && l.release != nil {
 		l.release()
@@ -293,7 +304,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 			return nil, false, err
 		}
 	}
-	client, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
+	client, clientKey, err := m.clientFor(selected.ID, scope, proxyURL, userAgent, cookies, sticky)
 	if err != nil {
 		return nil, false, err
 	}
@@ -302,7 +313,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	m.mu.Unlock()
 	recordSelection(ctx, Selection{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, Proxied: proxyURL != ""})
 	var once sync.Once
-	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, browser: client.browser, sticky: sticky, proxyPool: proxyPool, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
+	return &Lease{NodeID: selected.ID, NodeName: selected.Name, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: cookies, client: client.client, clientKey: clientKey, browser: client.browser, sticky: sticky, proxyPool: proxyPool, clearanceKey: clearanceKey, clearanceManager: m, release: func() {
 		once.Do(func() {
 			m.mu.Lock()
 			m.inflight[selected.ID]--
@@ -432,7 +443,7 @@ func (m *Manager) selectNode(nodes []domain.Node, affinity string) domain.Node {
 	return best
 }
 
-func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, error) {
+func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, cookies string, sticky bool) (cachedClient, clientCacheKey, error) {
 	clientKind := "browser"
 	if scope == domain.ScopeBuild {
 		clientKind = "build"
@@ -450,19 +461,19 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	if cached, ok := m.clients[key]; ok {
 		cached.lastUsed = now
 		m.clients[key] = cached
-		return cached, nil
+		return cached, key, nil
 	}
 	var value cachedClient
 	if scope == domain.ScopeBuild {
 		client, err := newBuildClient(proxyURL)
 		if err != nil {
-			return cachedClient{}, err
+			return cachedClient{}, clientCacheKey{}, err
 		}
 		value.client = client
 	} else {
 		client, err := newBrowserClient(proxyURL, userAgent)
 		if err != nil {
-			return cachedClient{}, err
+			return cachedClient{}, clientCacheKey{}, err
 		}
 		value.client = client
 		value.browser = client
@@ -481,7 +492,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	}
 	m.ensureClientCacheCapacityLocked()
 	m.clients[key] = value
-	return value, nil
+	return value, key, nil
 }
 
 func (m *Manager) cleanupClientCacheLocked(now time.Time) {
@@ -525,6 +536,34 @@ func (m *Manager) evictClientLocked(key clientCacheKey, value cachedClient) {
 
 func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, transportErr error) {
 	m.FeedbackForScope(ctx, domain.ScopeWeb, nodeID, status, transportErr)
+}
+
+// FeedbackLease keeps failures from account-bound proxy pools scoped to the
+// rejected browser session. The shared node remains available so another
+// account or pool identity can be selected immediately.
+func (m *Manager) FeedbackLease(ctx context.Context, lease *Lease, status int, transportErr error) {
+	if lease == nil {
+		return
+	}
+	if status == http.StatusForbidden && lease.proxyPool {
+		m.mu.Lock()
+		if lease.clientKey.fingerprint != "" {
+			cached, ok := m.clients[lease.clientKey]
+			if ok {
+				m.evictClientLocked(lease.clientKey, cached)
+			}
+		}
+		if lease.clearanceKey != "" {
+			state := m.clearances[lease.clearanceKey]
+			state.invalid = true
+			state.used = true
+			state.lastUsedAt = time.Now().UTC()
+			m.clearances[lease.clearanceKey] = state
+		}
+		m.mu.Unlock()
+		return
+	}
+	m.FeedbackForScope(ctx, lease.Scope, lease.NodeID, status, transportErr)
 }
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {

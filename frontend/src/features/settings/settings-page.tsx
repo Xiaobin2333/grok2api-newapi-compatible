@@ -115,8 +115,7 @@ export function SettingsPage() {
               <SettingsField controlId="web-statsig-mode" className="sm:col-span-2" label={t("settings.web.statsigMode")} description={t("settings.web.statsigModeHelp")} error={form.formState.errors.providerWeb?.statsigMode?.message}>
                 <Controller control={form.control} name="providerWeb.statsigMode" render={({ field }) => (
                   <Tabs value={field.value} onValueChange={field.onChange}>
-                    <TabsList id="web-statsig-mode" className="grid w-full grid-cols-3 bg-muted/55">
-                      <TabsTrigger value="local" className="font-normal">{t("settings.web.statsigLocal")}</TabsTrigger>
+                    <TabsList id="web-statsig-mode" className="grid w-full grid-cols-2 bg-muted/55">
                       <TabsTrigger value="manual" className="font-normal">{t("settings.web.statsigManual")}</TabsTrigger>
                       <TabsTrigger value="url" className="font-normal">{t("settings.web.statsigURL")}</TabsTrigger>
                     </TabsList>
@@ -127,11 +126,11 @@ export function SettingsPage() {
                 <SettingsField controlId="web-statsig-manual" className="sm:col-span-2" label={t("settings.web.statsigValue")} description={t("settings.web.statsigValueHelp")} badge={statsigManualConfigured ? t("settings.web.statsigConfigured") : undefined} error={form.formState.errors.providerWeb?.statsigManualValue?.message}>
                   <Input id="web-statsig-manual" type="password" autoComplete="off" placeholder={statsigManualConfigured ? t("settings.web.statsigKeepConfigured") : t("settings.web.statsigValuePlaceholder")} {...form.register("providerWeb.statsigManualValue")} />
                 </SettingsField>
-              ) : statsigMode === "url" ? (
+              ) : (
                 <SettingsField controlId="web-statsig-url" className="sm:col-span-2" label={t("settings.web.statsigSignerURL")} description={t("settings.web.statsigSignerURLHelp")} error={form.formState.errors.providerWeb?.statsigSignerURL?.message}>
                   <Input id="web-statsig-url" type="url" placeholder="http://grok-signer-go:8788/sign" {...form.register("providerWeb.statsigSignerURL")} />
                 </SettingsField>
-              ) : null}
+              )}
               <SettingsField controlId="web-quota-timeout" label={t("settings.web.quotaTimeout")} description={t("settings.web.quotaTimeoutHelp")} error={form.formState.errors.providerWeb?.quotaTimeout?.message}><Controller control={form.control} name="providerWeb.quotaTimeout" render={({ field }) => <DurationInput id="web-quota-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-chat-timeout" label={t("settings.web.chatTimeout")} description={t("settings.web.chatTimeoutHelp")} error={form.formState.errors.providerWeb?.chatTimeout?.message}><Controller control={form.control} name="providerWeb.chatTimeout" render={({ field }) => <DurationInput id="web-chat-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>
               <SettingsField controlId="web-image-timeout" label={t("settings.web.imageTimeout")} description={t("settings.web.imageTimeoutHelp")} error={form.formState.errors.providerWeb?.imageTimeout?.message}><Controller control={form.control} name="providerWeb.imageTimeout" render={({ field }) => <DurationInput id="web-image-timeout" value={field.value} onChange={field.onChange} />} /></SettingsField>

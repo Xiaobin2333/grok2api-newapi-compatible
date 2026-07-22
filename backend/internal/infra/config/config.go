@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	StatsigModeLocal              = "local"
 	StatsigModeManual             = "manual"
 	StatsigModeURL                = "url"
 	ClearanceModeManual           = "manual"
@@ -39,26 +38,6 @@ const (
 	maxAuditBufferSize    = 262144
 	maxAuditBatchSize     = 4096
 )
-
-// NormalizeLegacyStatsig moves installations that still point at the former
-// shared signer to the in-process signer. Explicit custom signer URLs remain
-// in URL mode.
-func NormalizeLegacyStatsig(mode, signerURL string) (string, string) {
-	mode = strings.TrimSpace(mode)
-	signerURL = strings.TrimSpace(signerURL)
-	if mode == "" || (mode == StatsigModeURL && (signerURL == "" || retiredStatsigSignerURL(signerURL))) {
-		return StatsigModeLocal, ""
-	}
-	if mode == StatsigModeLocal {
-		return mode, ""
-	}
-	return mode, signerURL
-}
-
-func retiredStatsigSignerURL(value string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(value))
-	return err == nil && strings.EqualFold(strings.TrimSuffix(parsed.Hostname(), "."), "grok.wodf.de")
-}
 
 // Config 表示后端运行配置。
 type Config struct {
@@ -448,20 +427,16 @@ func (c Config) Validate() error {
 		return errors.New("provider.web.baseURL 必须是无凭据的 HTTPS URL")
 	}
 	switch c.Provider.Web.StatsigMode {
-	case StatsigModeLocal:
 	case StatsigModeManual:
 		if !validStatsigID(c.Provider.Web.StatsigManualValue) {
 			return errors.New("provider.web 手动 x-statsig-id 格式无效")
 		}
 	case StatsigModeURL:
-		if retiredStatsigSignerURL(c.Provider.Web.StatsigSignerURL) {
-			return errors.New("provider.web 默认 Statsig 签名服务已停用，请使用 local 模式或自建签名服务")
-		}
 		if err := signerurl.Validate(c.Provider.Web.StatsigSignerURL); err != nil {
 			return fmt.Errorf("provider.web Statsig 签名 URL 无效: %w", err)
 		}
 	default:
-		return errors.New("provider.web Statsig 模式必须是 local、manual 或 url")
+		return errors.New("provider.web Statsig 模式必须是 manual 或 url")
 	}
 	switch c.Provider.Web.ClearanceMode {
 	case ClearanceModeManual:
@@ -588,7 +563,7 @@ func defaultConfig() Config {
 				UserAgent: RecommendedBuildUserAgent,
 			},
 			Web: WebProviderConfig{
-				BaseURL: "https://grok.com", StatsigMode: StatsigModeLocal,
+				BaseURL: "https://grok.com", StatsigMode: StatsigModeURL, StatsigSignerURL: DefaultStatsigSignerURL,
 				ClearanceMode: ClearanceModeManual, FlareSolverrURL: DefaultFlareSolverrURL,
 				ClearanceTimeout: Duration(time.Minute), ClearanceRefresh: Duration(10 * time.Minute),
 				QuotaTimeout: Duration(25 * time.Second),

@@ -49,7 +49,7 @@ export const settingsSchema = z.object({
   }),
   providerWeb: z.object({
     baseURL: z.url().refine((value) => value.startsWith("https://")),
-    statsigMode: z.enum(["local", "manual", "url"]),
+    statsigMode: z.enum(["manual", "url"]),
     statsigManualValue: z.string().trim().max(4096),
     statsigManualConfigured: z.boolean(),
     statsigSignerURL: z.string().trim().max(2048),
@@ -273,7 +273,6 @@ function validStatsigSignerURL(value: string): boolean {
   try {
     const parsed = new URL(value);
     if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") return false;
-    if (parsed.hostname.toLowerCase().replace(/\.$/, "") === "grok.wodf.de") return false;
     const internal = internalSignerHostname(parsed.hostname);
     if (internal) return parsed.protocol === "http:" || parsed.protocol === "https:";
     return parsed.protocol === "https:" && (parsed.port === "" || parsed.port === "443");
