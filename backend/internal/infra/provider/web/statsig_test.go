@@ -261,6 +261,25 @@ func TestApplySignedStatsigNeverLeavesRandomFallback(t *testing.T) {
 	}
 }
 
+func TestApplySignedStatsigLocalGeneratesFreshValidHeader(t *testing.T) {
+	adapter := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "local"}}
+	request, err := http.NewRequest(http.MethodPost, "https://grok.com/rest/app-chat/conversations/new", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter.applySignedStatsig(context.Background(), request, "", nil)
+	first := request.Header.Get("x-statsig-id")
+	if !validStatsigID(first) {
+		t.Fatalf("invalid local x-statsig-id %q", first)
+	}
+	for attempt := 0; attempt < 8 && request.Header.Get("x-statsig-id") == first; attempt++ {
+		adapter.applySignedStatsig(context.Background(), request, "", nil)
+	}
+	if request.Header.Get("x-statsig-id") == first {
+		t.Fatal("local Statsig did not refresh its per-request mask")
+	}
+}
+
 func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 	manual := &Adapter{cfg: Config{StatsigMode: "manual"}, statsig: newStatsigSigner()}
 	if manual.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
@@ -269,5 +288,9 @@ func TestStatsigInvalidationOnlyAppliesToURLMode(t *testing.T) {
 	urlMode := &Adapter{cfg: Config{BaseURL: "https://grok.com", StatsigMode: "url", StatsigSignerURL: "https://signer.example/sign"}, statsig: newStatsigSigner()}
 	if !urlMode.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
 		t.Fatal("URL Statsig must be invalidated after anti-bot rejection")
+	}
+	local := &Adapter{cfg: Config{StatsigMode: "local"}, statsig: newStatsigSigner()}
+	if !local.invalidateSignedStatsig(http.MethodPost, "https://grok.com/rest/test") {
+		t.Fatal("local Statsig must permit a fresh retry after anti-bot rejection")
 	}
 }

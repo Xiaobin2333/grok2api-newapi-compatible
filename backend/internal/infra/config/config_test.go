@@ -265,6 +265,12 @@ func TestValidateStatsigModes(t *testing.T) {
 	base := defaultConfig()
 	base.Secrets.JWTSecret = "12345678901234567890123456789012"
 	base.Secrets.CredentialEncryptionKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	if base.Provider.Web.StatsigMode != StatsigModeLocal {
+		t.Fatalf("default Statsig mode = %q", base.Provider.Web.StatsigMode)
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid local Statsig rejected: %v", err)
+	}
 
 	manual := base
 	manual.Provider.Web.StatsigMode = StatsigModeManual
@@ -286,6 +292,34 @@ func TestValidateStatsigModes(t *testing.T) {
 	remote.Provider.Web.StatsigSignerURL = "http://signer.example.com:8788/sign"
 	if err := remote.Validate(); err == nil {
 		t.Fatal("public plaintext Statsig signer URL was accepted")
+	}
+	remote.Provider.Web.StatsigSignerURL = DefaultStatsigSignerURL
+	if err := remote.Validate(); err == nil {
+		t.Fatal("retired default Statsig signer was accepted")
+	}
+}
+
+func TestNormalizeLegacyStatsig(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mode       string
+		signerURL  string
+		wantMode   string
+		wantSigner string
+	}{
+		{name: "empty legacy", wantMode: StatsigModeLocal},
+		{name: "retired default", mode: StatsigModeURL, signerURL: DefaultStatsigSignerURL, wantMode: StatsigModeLocal},
+		{name: "retired default variant", mode: StatsigModeURL, signerURL: "https://grok.wodf.de/sign/", wantMode: StatsigModeLocal},
+		{name: "explicit local", mode: StatsigModeLocal, signerURL: DefaultStatsigSignerURL, wantMode: StatsigModeLocal},
+		{name: "custom signer", mode: StatsigModeURL, signerURL: "http://grok-signer-go:8788/sign", wantMode: StatsigModeURL, wantSigner: "http://grok-signer-go:8788/sign"},
+		{name: "manual", mode: StatsigModeManual, signerURL: "ignored", wantMode: StatsigModeManual, wantSigner: "ignored"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mode, signerURL := NormalizeLegacyStatsig(test.mode, test.signerURL)
+			if mode != test.wantMode || signerURL != test.wantSigner {
+				t.Fatalf("mode=%q signer=%q", mode, signerURL)
+			}
+		})
 	}
 }
 

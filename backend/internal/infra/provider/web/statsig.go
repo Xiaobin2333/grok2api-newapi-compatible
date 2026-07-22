@@ -15,18 +15,19 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	configinfra "github.com/chenyme/grok2api/backend/internal/infra/config"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/provider/web/statsiglocal"
 	"github.com/chenyme/grok2api/backend/internal/pkg/signerurl"
 	"golang.org/x/net/html"
 	"golang.org/x/sync/singleflight"
 )
 
 const (
-	defaultStatsigSignerURL = "https://grok.wodf.de/sign"
-	statsigCacheTTL         = time.Hour
-	statsigCacheMaxEntries  = 4096
-	statsigMetaBodyLimit    = 4 << 20
-	statsigResponseLimit    = 4 << 10
+	statsigCacheTTL        = time.Hour
+	statsigCacheMaxEntries = 4096
+	statsigMetaBodyLimit   = 4 << 20
+	statsigResponseLimit   = 4 << 10
 )
 
 type statsigCacheEntry struct {
@@ -369,10 +370,27 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 	}
 	cfg := a.config()
 	request.Header.Del("x-statsig-id")
-	if cfg.StatsigMode == "manual" {
+	switch cfg.StatsigMode {
+	case configinfra.StatsigModeLocal, "":
+		path := "/"
+		if request.URL != nil && request.URL.EscapedPath() != "" {
+			path = request.URL.EscapedPath()
+		}
+		value, err := statsiglocal.Generate(path, request.Method, time.Now().Unix())
+		if err != nil || !validStatsigID(value) {
+			a.log().Warn("web_statsig_local_failed", "method", request.Method, "path", path, "error", err)
+			return
+		}
+		request.Header.Set("x-statsig-id", value)
+		return
+	case configinfra.StatsigModeManual:
 		if value := strings.TrimSpace(cfg.StatsigManualValue); validStatsigID(value) {
 			request.Header.Set("x-statsig-id", value)
 		}
+		return
+	case configinfra.StatsigModeURL:
+	default:
+		a.log().Warn("web_statsig_unknown_mode", "mode", cfg.StatsigMode)
 		return
 	}
 	if a.statsig == nil {
@@ -394,7 +412,13 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 // WarmStatsig 只使用一个 Web 账号和一个出口租约预热共享签名，不会逐账号访问上游。
 func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential) (int, error) {
 	cfg := a.config()
-	if cfg.StatsigMode == "manual" {
+	switch cfg.StatsigMode {
+	case configinfra.StatsigModeLocal, "":
+		if _, err := statsiglocal.Generate("/rest/app-chat/conversations/new", http.MethodPost, time.Now().Unix()); err != nil {
+			return 0, fmt.Errorf("本地 Statsig 签名失败: %w", err)
+		}
+		return 0, nil
+	case configinfra.StatsigModeManual:
 		if !validStatsigID(strings.TrimSpace(cfg.StatsigManualValue)) {
 			return 0, fmt.Errorf("手动 Statsig 配置无效")
 		}
@@ -422,7 +446,10 @@ func (a *Adapter) WarmStatsig(ctx context.Context, credential account.Credential
 
 func (a *Adapter) invalidateSignedStatsig(method, target string) bool {
 	cfg := a.config()
-	if cfg.StatsigMode == "url" && a.statsig != nil {
+	if cfg.StatsigMode == configinfra.StatsigModeLocal || cfg.StatsigMode == "" {
+		return true
+	}
+	if cfg.StatsigMode == configinfra.StatsigModeURL && a.statsig != nil {
 		a.statsig.Invalidate(cfg.BaseURL, cfg.StatsigSignerURL, method, target)
 		if parsed, err := url.Parse(target); err == nil {
 			a.log().Info("web_statsig_invalidated", "method", method, "path", parsed.EscapedPath())

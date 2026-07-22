@@ -59,6 +59,7 @@ Grok2API is a Go-based Grok API gateway with a built-in React admin console. It 
 
 ### Enhancements in this fork
 
+- **Local Statsig signing**: Grok Web now generates a fresh method/path-specific `x-statsig-id` in-process by default instead of depending on the public signer currently challenged by Cloudflare. Legacy default-URL settings migrate automatically, while manual values and explicitly configured private signers remain available.
 - **Automatic Grok image routing**: callers may consistently request `grok-imagine-image`; requests with references are normalized to `grok-imagine-image-edit` before capability checks, account selection, billing, and audit creation.
 - **OpenAI-compatible image edits**: `/v1/images/edits` accepts JSON URLs and OpenAI SDK `multipart/form-data` uploads through `image`, `image[]`, `images`, `images[]`, `image_urls`, and `image_urls[]`. Multipart text values also accept URL strings, `{ "url": "..." }` objects, and mixed JSON arrays. URL, `b64_json`, and SSE responses retain the existing Images protocol.
 - **Free/Basic Chat image editing**: an admin switch lets Basic Web accounts simulate `grok-imagine-image-edit` through `grok-chat-fast` attachments. The adapter sends a strict image-to-image preservation contract, isolates numbered reference roles, disables side-by-side variants, and inherits the first reference's real aspect ratio when the caller uses `auto` or omits a ratio.

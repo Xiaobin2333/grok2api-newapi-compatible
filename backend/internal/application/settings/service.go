@@ -302,9 +302,14 @@ func applyDomainConfig(base config.Config, value settingsdomain.Config) config.C
 	if clearanceRefresh <= 0 {
 		clearanceRefresh = base.Provider.Web.ClearanceRefresh.Value()
 	}
+	statsigMode, statsigSignerURL := config.NormalizeLegacyStatsig(value.ProviderWeb.StatsigMode, value.ProviderWeb.StatsigSignerURL)
+	statsigManualValue := value.ProviderWeb.StatsigManualValue
+	if statsigMode != config.StatsigModeManual {
+		statsigManualValue = ""
+	}
 	base.Provider.Web = config.WebProviderConfig{
 		BaseURL: value.ProviderWeb.BaseURL, QuotaTimeout: config.Duration(value.ProviderWeb.QuotaTimeout),
-		StatsigMode: value.ProviderWeb.StatsigMode, StatsigManualValue: value.ProviderWeb.StatsigManualValue, StatsigSignerURL: value.ProviderWeb.StatsigSignerURL,
+		StatsigMode: statsigMode, StatsigManualValue: statsigManualValue, StatsigSignerURL: statsigSignerURL,
 		ClearanceMode: clearanceMode, FlareSolverrURL: flareSolverrURL,
 		ClearanceTimeout: config.Duration(clearanceTimeout), ClearanceRefresh: config.Duration(clearanceRefresh),
 		ChatTimeout: config.Duration(value.ProviderWeb.ChatTimeout), ImageTimeout: config.Duration(value.ProviderWeb.ImageTimeout),
@@ -453,6 +458,9 @@ func mergeEditable(current config.Config, input EditableConfig) (config.Config, 
 	next.Provider.Web.BaseURL = strings.TrimSpace(input.ProviderWeb.BaseURL)
 	next.Provider.Web.StatsigMode = strings.TrimSpace(input.ProviderWeb.StatsigMode)
 	next.Provider.Web.StatsigSignerURL = strings.TrimSpace(input.ProviderWeb.StatsigSignerURL)
+	if next.Provider.Web.StatsigMode == config.StatsigModeLocal {
+		next.Provider.Web.StatsigSignerURL = ""
+	}
 	if input.ProviderWeb.ClearanceProvided {
 		next.Provider.Web.ClearanceMode = strings.TrimSpace(input.ProviderWeb.ClearanceMode)
 		next.Provider.Web.FlareSolverrURL = strings.TrimSpace(input.ProviderWeb.FlareSolverrURL)

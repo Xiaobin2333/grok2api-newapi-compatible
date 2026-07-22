@@ -214,22 +214,51 @@ func TestStatsigManualValueIsWriteOnlyAndClearedByURLMode(t *testing.T) {
 
 	urlMode := service.Get().Config
 	urlMode.ProviderWeb.StatsigMode = config.StatsigModeURL
+	urlMode.ProviderWeb.StatsigSignerURL = "http://grok-signer-go:8788/sign"
 	if _, err := service.Update(context.Background(), service.Get().Revision, urlMode); err != nil {
 		t.Fatal(err)
 	}
 	if repository.value.ProviderWeb.StatsigManualValue != "" {
 		t.Fatal("URL mode retained the manual x-statsig-id")
 	}
+
+	localMode := service.Get().Config
+	localMode.ProviderWeb.StatsigMode = config.StatsigModeLocal
+	if _, err := service.Update(context.Background(), service.Get().Revision, localMode); err != nil {
+		t.Fatal(err)
+	}
+	if repository.value.ProviderWeb.StatsigSignerURL != "" {
+		t.Fatal("local mode retained the URL signer")
+	}
 }
 
-func TestLoadPersistedRejectsIncompleteStatsigPayload(t *testing.T) {
+func TestLoadPersistedMigratesIncompleteStatsigPayloadToLocal(t *testing.T) {
 	cfg := testConfig(t)
 	value := toDomainConfig(cfg)
 	value.ProviderWeb.StatsigMode = ""
 	value.ProviderWeb.StatsigSignerURL = ""
 	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
-	if _, _, _, err := LoadPersisted(context.Background(), cfg, repository); err == nil {
-		t.Fatal("incomplete Statsig settings were accepted")
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Provider.Web.StatsigMode != config.StatsigModeLocal || loaded.Provider.Web.StatsigSignerURL != "" {
+		t.Fatalf("Statsig mode=%q signer=%q", loaded.Provider.Web.StatsigMode, loaded.Provider.Web.StatsigSignerURL)
+	}
+}
+
+func TestLoadPersistedMigratesRetiredStatsigSignerToLocal(t *testing.T) {
+	cfg := testConfig(t)
+	value := toDomainConfig(cfg)
+	value.ProviderWeb.StatsigMode = config.StatsigModeURL
+	value.ProviderWeb.StatsigSignerURL = config.DefaultStatsigSignerURL
+	repository := &runtimeSettingsRepositoryStub{value: value, found: true}
+	loaded, _, _, err := LoadPersisted(context.Background(), cfg, repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Provider.Web.StatsigMode != config.StatsigModeLocal || loaded.Provider.Web.StatsigSignerURL != "" {
+		t.Fatalf("Statsig mode=%q signer=%q", loaded.Provider.Web.StatsigMode, loaded.Provider.Web.StatsigSignerURL)
 	}
 }
 
